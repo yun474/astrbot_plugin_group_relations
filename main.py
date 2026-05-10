@@ -48,8 +48,9 @@ def _split_config_list(value) -> set[str]:
 
 
 class GroupRelationsPlugin(Star):
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config=None):
         super().__init__(context)
+        self.config = config or getattr(self, "config", {}) or {}
         data_dir = Path(get_astrbot_data_path()) / "plugin_data" / PLUGIN_NAME
         self.store = RelationStore(data_dir)
         self.store.load()
