@@ -3,7 +3,7 @@ desc: Group relationship memory for AstrBot.
 help: Use /关系 help to manage and query relationship memory.
 version: v0.1.0
 author: Codex
-repo: ""
+repo: "https://github.com/yun474/astrbot_plugin_group_relations"
 display_name: 群关系记忆
 short_desc: 让机器人记住群内人物关系、身份和关联。
 astrbot_version: ">=4.9.2"

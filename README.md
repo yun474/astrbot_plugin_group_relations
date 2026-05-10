@@ -22,7 +22,7 @@
 /关系 向量
 ```
 
-这些指令只用于开关检查和 debug，不是主要交互入口。
+这些指令只用于开关检查和 debug，不是主要交互入口。默认只有配置里的管理员或平台可识别的管理员可以使用，避免把群关系记忆暴露给普通成员。
 
 ## LLM 工具
 
@@ -39,6 +39,8 @@
 - `summary_provider_id`：自动总结使用的 LLM Provider，留空使用当前会话模型。
 - `memory_scope`：记忆隔离范围，默认 `session`，可选 `session` / `group` / `global`。
 - `enable_session_identity_injection`：是否明确注入“当前在哪个群聊/私聊”的会话身份说明，默认开启。
+- `relation_admin_user_ids`：允许使用 `/关系` 调试指令的用户 ID，多个 ID 可用英文逗号或换行分隔。
+- `allow_public_debug_commands`：是否允许所有人使用 `/关系` 调试指令，默认关闭，只建议测试群临时开启。
 - `injection_top_k`：每轮注入关系数量，默认 5。
 - `enable_person_profile`：是否生成当前发言人的简易画像，默认开启。
 - `embedding_provider_id`：AstrBot Embedding Provider。留空时自动使用第一个可用 Provider。
@@ -47,4 +49,4 @@
 - `enable_tool_update`：是否允许 LLM 主动修改/删除关系，默认关闭。
 - `enable_auto_extract`：是否自动从群聊消息抽取关系，默认关闭。
 
-建议先开启自动注入和工具搜索；写入、修改、删除能力等你确认模型行为稳定后再打开。
+建议先开启自动注入和工具搜索；写入、修改、删除能力等你确认模型行为稳定后再打开。没有 AstrBot Embedding Provider 时，插件会保留轻量本地检索能力，避免关系被写入后完全搜不到；如果要获得更好的召回效果，仍建议配置正式的 Embedding Provider。

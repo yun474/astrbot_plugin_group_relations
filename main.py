@@ -39,6 +39,14 @@ def _sender_name(event: AstrMessageEvent) -> str:
     return str(event.get_sender_name() or event.get_sender_id() or "未知成员")
 
 
+def _split_config_list(value) -> set[str]:
+    if isinstance(value, list):
+        return {str(item).strip() for item in value if str(item).strip()}
+    if isinstance(value, str):
+        return {item.strip() for item in value.replace(",", "\n").splitlines() if item.strip()}
+    return set()
+
+
 class GroupRelationsPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -85,6 +93,9 @@ class GroupRelationsPlugin(Star):
     @relations.command("状态")
     async def status(self, event: AstrMessageEvent):
         """查看插件状态。"""
+        if not self._can_use_debug_commands(event):
+            yield event.plain_result(self._debug_denied_message())
+            return
         provider = self._get_embedding_provider(silent=True)
         yield event.plain_result(
             "\n".join(
@@ -109,6 +120,9 @@ class GroupRelationsPlugin(Star):
     @relations.command("调试")
     async def debug_search(self, event: AstrMessageEvent, query: str = ""):
         """调试自动召回结果。"""
+        if not self._can_use_debug_commands(event):
+            yield event.plain_result(self._debug_denied_message())
+            return
         query = query or self._build_injection_query(event, None)
         matches = await self._search_relations(event, query)
         if not matches:
@@ -129,6 +143,9 @@ class GroupRelationsPlugin(Star):
     @relations.command("最近")
     async def recent(self, event: AstrMessageEvent):
         """查看最近关系记录。"""
+        if not self._can_use_debug_commands(event):
+            yield event.plain_result(self._debug_denied_message())
+            return
         records = self.store.recent(
             self._scope_id(event),
             limit=int(self.config.get("max_query_results", 8)),
@@ -138,6 +155,9 @@ class GroupRelationsPlugin(Star):
     @relations.command("向量")
     async def vector_status(self, event: AstrMessageEvent):
         """查看向量化配置。"""
+        if not self._can_use_debug_commands(event):
+            yield event.plain_result(self._debug_denied_message())
+            return
         self._refresh_embedding_provider_options()
         await self._maybe_reembed_records()
         provider_id = str(self.config.get("embedding_provider_id", "")).strip()
@@ -335,7 +355,7 @@ class GroupRelationsPlugin(Star):
             object_=object_ or None,
             note=note if note else None,
             confidence=None if confidence < 0 else confidence,
-            vector=vector or [],
+            vector=vector,
             embedding_provider_id=provider_id,
         )
         yield event.plain_result(f"已更新：{format_record(updated)}" if updated else "更新失败。")
@@ -408,9 +428,30 @@ class GroupRelationsPlugin(Star):
             note=note,
             source=source,
             confidence=confidence,
-            vector=vector or [],
+            vector=vector,
             embedding_provider_id=provider_id,
         )
+
+    def _debug_denied_message(self) -> str:
+        return "这个调试指令会暴露群关系记忆，当前只允许配置里的管理员使用。"
+
+    def _can_use_debug_commands(self, event: AstrMessageEvent) -> bool:
+        if bool(self.config.get("allow_public_debug_commands", False)):
+            return True
+        sender_id = str(event.get_sender_id() or "").strip()
+        admin_ids = _split_config_list(self.config.get("relation_admin_user_ids", ""))
+        if sender_id and sender_id in admin_ids:
+            return True
+        for attr_name in ("is_admin", "is_group_admin", "is_super_admin"):
+            attr = getattr(event, attr_name, None)
+            try:
+                if callable(attr) and bool(attr()):
+                    return True
+                if attr is not None and not callable(attr) and bool(attr):
+                    return True
+            except Exception:
+                continue
+        return False
 
     async def _get_summary_provider_id(self, event: AstrMessageEvent) -> str:
         provider_id = str(self.config.get("summary_provider_id", "")).strip()
@@ -467,7 +508,7 @@ class GroupRelationsPlugin(Star):
         threshold = float(self.config.get("similarity_threshold", 0.12))
         vector, _provider_id = await self._embed(query)
         if not vector:
-            return []
+            return self.store.search_by_text(self._scope_id(event), query, limit=limit)
         return self.store.search_by_vector(
             self._scope_id(event),
             query,
@@ -747,8 +788,25 @@ class GroupRelationsPlugin(Star):
         for item in payload:
             if not isinstance(item, dict):
                 continue
-            if item.get("subject") and item.get("relation") and item.get("object"):
-                relations.append(item)
+            subject = str(item.get("subject") or "").strip()
+            relation = str(item.get("relation") or "").strip()
+            object_ = str(item.get("object") or "").strip()
+            if not subject or not relation or not object_:
+                continue
+            note = str(item.get("note") or "").strip()
+            try:
+                confidence = float(item.get("confidence", 0.65))
+            except (TypeError, ValueError):
+                confidence = 0.65
+            relations.append(
+                {
+                    "subject": subject[:80],
+                    "relation": relation[:80],
+                    "object": object_[:80],
+                    "note": note[:240],
+                    "confidence": max(0.0, min(1.0, confidence)),
+                }
+            )
         return relations
 
     async def terminate(self):

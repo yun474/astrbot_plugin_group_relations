@@ -6,7 +6,7 @@ import math
 import os
 import re
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -35,12 +35,20 @@ class RelationRecord:
 
 
 def normalize_text(value: str) -> str:
-    return re.sub(r"\s+", " ", value.strip().lower())
+    return re.sub(r"\s+", " ", str(value or "").strip().lower())
 
 
 def relation_id(group_id: str, subject: str, relation: str, object_: str) -> str:
     raw = f"{group_id}|{normalize_text(subject)}|{normalize_text(relation)}|{normalize_text(object_)}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def clamp_confidence(value: Any, default: float = 1.0) -> float:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        confidence = default
+    return max(0.0, min(1.0, confidence))
 
 
 def _tokens(text: str) -> list[str]:
@@ -94,11 +102,11 @@ class RelationStore:
             self.vectors = {}
             return
         records = payload.get("relations", [])
-        self.records = {
-            item["id"]: RelationRecord(**item)
-            for item in records
-            if isinstance(item, dict) and item.get("id")
-        }
+        self.records = {}
+        for item in records:
+            record = self._coerce_record(item)
+            if record:
+                self.records[record.id] = record
         self.vectors = {
             record_id: vector
             for record_id, vector in payload.get("vectors", {}).items()
@@ -109,6 +117,23 @@ class RelationStore:
         for record_id, record in self.records.items():
             if record_id not in self.vectors:
                 self.vectors[record_id] = embed_text(record.text())
+
+    def _coerce_record(self, item: Any) -> RelationRecord | None:
+        if not isinstance(item, dict):
+            return None
+        required = ["id", "group_id", "subject", "relation", "object"]
+        if any(not item.get(key) for key in required):
+            return None
+        allowed = {field_.name for field_ in fields(RelationRecord)}
+        payload = {key: value for key, value in item.items() if key in allowed}
+        try:
+            payload["confidence"] = clamp_confidence(payload.get("confidence", 1.0))
+            payload["created_at"] = int(payload.get("created_at") or time.time())
+            payload["updated_at"] = int(payload.get("updated_at") or payload["created_at"])
+            payload["embedding_dim"] = int(payload.get("embedding_dim") or 0)
+            return RelationRecord(**payload)
+        except (TypeError, ValueError):
+            return None
 
     def save(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -141,7 +166,7 @@ class RelationStore:
         if existing:
             existing.note = note or existing.note
             existing.source = source or existing.source
-            existing.confidence = max(existing.confidence, confidence)
+            existing.confidence = max(existing.confidence, clamp_confidence(confidence))
             existing.updated_at = now
             if embedding_provider_id:
                 existing.embedding_provider_id = embedding_provider_id
@@ -157,7 +182,7 @@ class RelationStore:
                 object=object_.strip(),
                 note=note.strip(),
                 source=source,
-                confidence=confidence,
+                confidence=clamp_confidence(confidence),
                 embedding_provider_id=embedding_provider_id,
                 embedding_dim=len(vector or []),
             )
@@ -210,6 +235,22 @@ class RelationStore:
         else:
             self.vectors[relation_id_] = embed_text(record.text())
         record.updated_at = int(time.time())
+        new_id = relation_id(record.group_id, record.subject, record.relation, record.object)
+        if new_id != relation_id_:
+            self.records.pop(relation_id_, None)
+            self.vectors.pop(relation_id_, None)
+            record.id = new_id
+            if new_id in self.records:
+                existing = self.records[new_id]
+                existing.note = record.note or existing.note
+                existing.source = record.source or existing.source
+                existing.confidence = max(existing.confidence, record.confidence)
+                existing.updated_at = record.updated_at
+                existing.embedding_provider_id = record.embedding_provider_id
+                existing.embedding_dim = record.embedding_dim
+                record = existing
+            self.records[new_id] = record
+            self.vectors[new_id] = normalize_vector(vector) if vector is not None else embed_text(record.text())
         self.save()
         return record
 
@@ -236,6 +277,33 @@ class RelationStore:
     ) -> list[tuple[RelationRecord, float]]:
         query_vector = embed_text(query)
         return self.search_by_vector(group_id, query, query_vector, limit=limit, threshold=threshold)
+
+    def search_by_text(
+        self,
+        group_id: str,
+        query: str,
+        limit: int = 8,
+    ) -> list[tuple[RelationRecord, float]]:
+        query_norm = normalize_text(query)
+        if not query_norm:
+            return [(record, 0.0) for record in self.recent(group_id, limit=limit)]
+        scored: list[tuple[RelationRecord, float]] = []
+        query_tokens = set(_tokens(query_norm))
+        for record in self.records.values():
+            if record.group_id != group_id:
+                continue
+            record_norm = normalize_text(record.text())
+            if query_norm in record_norm:
+                scored.append((record, 0.25))
+                continue
+            record_tokens = set(_tokens(record_norm))
+            if not query_tokens or not record_tokens:
+                continue
+            overlap = len(query_tokens & record_tokens) / max(len(query_tokens), 1)
+            if overlap >= 0.15:
+                scored.append((record, overlap))
+        scored.sort(key=lambda item: (item[1], item[0].updated_at), reverse=True)
+        return scored[:limit]
 
     def search_by_vector(
         self,

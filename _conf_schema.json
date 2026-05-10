@@ -58,6 +58,18 @@
     "default": true,
     "hint": "开启后，会明确告诉 LLM 当前是在某个群聊或私聊中、群名/会话名是什么、发言人是谁。"
   },
+  "relation_admin_user_ids": {
+    "description": "允许使用 /关系 调试指令的用户 ID",
+    "type": "string",
+    "default": "",
+    "hint": "多个 ID 可用英文逗号或换行分隔。为空时仅尝试允许平台上可识别的管理员；为避免泄露群关系记忆，不建议公开。"
+  },
+  "allow_public_debug_commands": {
+    "description": "是否允许所有人使用 /关系 调试指令",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，任何成员都可以查看当前会话的关系记忆、状态和召回结果。只建议在测试群临时开启。"
+  },
   "injection_top_k": {
     "description": "每轮自动注入的关系数量",
     "type": "int",
