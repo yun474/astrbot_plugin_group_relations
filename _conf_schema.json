@@ -1,0 +1,153 @@
+{
+  "enable_auto_extract": {
+    "description": "是否从群聊消息中自动抽取人物关系",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后会调用当前会话模型分析群消息，建议先观察成本和隐私边界。"
+  },
+  "enable_dialogue_summary": {
+    "description": "是否每隔几轮对话自动总结并写入关系",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，插件会定期把最近几轮对话交给 LLM 总结，抽取明确的人物关系并写入记忆。"
+  },
+  "summary_trigger_rounds": {
+    "description": "自动总结触发轮数",
+    "type": "int",
+    "default": 6,
+    "hint": "一轮约等于一次用户消息和一次机器人回复。建议 4-10。"
+  },
+  "summary_provider_id": {
+    "description": "自动总结使用的 LLM Provider",
+    "type": "string",
+    "_special": "select_provider",
+    "default": "",
+    "hint": "留空时使用当前会话正在使用的聊天模型。建议选择便宜、稳定、擅长结构化抽取的模型。"
+  },
+  "summary_max_dialogue_chars": {
+    "description": "自动总结最大对话长度",
+    "type": "int",
+    "default": 4000,
+    "hint": "超过该长度会截断最近内容，避免总结请求过大。"
+  },
+  "enable_context_injection": {
+    "description": "是否在每次 LLM 请求前自动注入群关系上下文",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，会根据群名、群名片/昵称和本轮消息召回少量人物关系，作为临时上下文注入给 LLM。"
+  },
+  "memory_scope": {
+    "description": "记忆隔离范围",
+    "type": "string",
+    "default": "session",
+    "options": [
+      "session",
+      "group",
+      "global"
+    ],
+    "labels": [
+      "按会话隔离（推荐，群聊/私聊各自独立）",
+      "按群隔离（仅群聊隔离，私聊按会话）",
+      "全局共享（所有会话共用）"
+    ],
+    "hint": "推荐 session：群聊和私聊都会拥有独立关系记忆，也更容易让 LLM 理解当前正在哪个会话中。"
+  },
+  "enable_session_identity_injection": {
+    "description": "是否注入当前会话身份说明",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，会明确告诉 LLM 当前是在某个群聊或私聊中、群名/会话名是什么、发言人是谁。"
+  },
+  "injection_top_k": {
+    "description": "每轮自动注入的关系数量",
+    "type": "int",
+    "default": 5,
+    "hint": "建议 3-8。过大会增加 token 消耗，也可能干扰回答。"
+  },
+  "enable_person_profile": {
+    "description": "是否生成简易人物画像",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，会从当前召回关系中整理当前发言人的简短画像。"
+  },
+  "person_profile_max_items": {
+    "description": "人物画像最多使用的关系条数",
+    "type": "int",
+    "default": 4
+  },
+  "enable_tool_read": {
+    "description": "是否允许模型通过工具查询群关系记忆",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，支持函数调用的模型可以主动检索群内人物关系。"
+  },
+  "enable_tool_write": {
+    "description": "是否允许模型通过工具写入群关系记忆",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，支持函数调用的模型可以主动保存它认为明确的人物关系。建议谨慎开启。"
+  },
+  "enable_tool_update": {
+    "description": "是否允许模型通过工具修改/删除群关系记忆",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后，模型可在用户明确纠正时更新或删除关系。建议与写入工具一起谨慎开启。"
+  },
+  "embedding_provider_id": {
+    "description": "AstrBot 向量化模型 Provider ID",
+    "type": "string",
+    "default": "",
+    "hint": "选择 AstrBot 服务提供商中已配置的 Embedding Provider。留空时自动使用第一个可用 Embedding Provider。",
+    "options": [
+      ""
+    ],
+    "labels": [
+      "自动选择第一个可用 Embedding Provider"
+    ]
+  },
+  "enable_local_embedding_fallback": {
+    "description": "AstrBot 向量化不可用时是否回退到本地哈希向量",
+    "type": "bool",
+    "default": false,
+    "hint": "默认关闭，避免静默使用非 AstrBot 向量。开启后，如果 AstrBot Embedding Provider 不可用，会回退到本地哈希向量。"
+  },
+  "reembed_on_provider_change": {
+    "description": "切换向量化模型后是否自动重建现有关系向量",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后插件启动时会尝试用当前 embedding_provider_id 重建旧关系向量，可能消耗额度。"
+  },
+  "auto_extract_min_length": {
+    "description": "自动抽取的最短消息长度",
+    "type": "int",
+    "default": 12
+  },
+  "max_query_results": {
+    "description": "查询时返回的最大关系数",
+    "type": "int",
+    "default": 8
+  },
+  "max_embedding_text_length": {
+    "description": "单次向量化文本最大长度",
+    "type": "int",
+    "default": 2000,
+    "hint": "写入和查询都会在调用 Embedding Provider 前截断到该长度，避免触发模型 token 上限。"
+  },
+  "max_injected_text_length": {
+    "description": "自动注入上下文最大长度",
+    "type": "int",
+    "default": 1200,
+    "hint": "超过该长度会截断，避免关系记忆占用过多上下文。"
+  },
+  "similarity_threshold": {
+    "description": "轻量向量检索阈值",
+    "type": "float",
+    "default": 0.12,
+    "hint": "值越高越严格。使用 AstrBot Embedding Provider 时建议根据模型效果微调。"
+  },
+  "debug_include_scores": {
+    "description": "调试输出是否显示召回分数",
+    "type": "bool",
+    "default": true
+  }
+}
