@@ -154,6 +154,42 @@
     "default": true,
     "hint": "只在刚创建群空间或当前发言人没有身份记录时尝试归纳群主/管理/群友；已有身份后不会反复扫描。"
   },
+  "群成员目录_初始化获取": {
+    "description": "新群空间初始化时是否获取群成员目录",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后会在新群空间首次触达时尝试调用平台 API 获取群成员列表，并自动填入群主/管理员/群友目录；平台不支持时会退化为记录已发言成员。"
+  },
+  "群成员目录_写入时校验": {
+    "description": "写入画像和关系前是否校验群成员目录",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，LLM 或 WebUI 往群空间写入用户画像/带 user_id 的关系时，会先确认 user_id 在群成员目录中；没找到会刷新目录再查，仍没有就拒绝。"
+  },
+  "记忆写入_关系必须包含群成员ID": {
+    "description": "关系记忆是否必须包含至少一个群成员 user_id",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，自动总结和 LLM 工具写入关系时，subject_user_id 或 object_user_id 至少填一个，减少非本群人物和纯文本关系污染群空间。"
+  },
+  "记忆写入_最小事实长度": {
+    "description": "自动写入记忆的最小事实长度",
+    "type": "int",
+    "default": 8,
+    "hint": "低于该长度的自动抽取/总结结果会被认为太碎，不写入。手动 WebUI 写入不受影响。"
+  },
+  "记忆写入_写入重要度阈值": {
+    "description": "自动写入记忆的最低长期重要度",
+    "type": "float",
+    "default": 0.55,
+    "hint": "总结提示词会要求模型输出 importance；低于该值的临时小事、当天状态、普通寒暄不会写入。"
+  },
+  "召回_优先使用用户ID和文本": {
+    "description": "关系召回是否优先使用 user_id 和文本匹配",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，每轮注入和工具查询会优先按当前发言人 user_id 召回关系，文本检索只做补充；关闭后才走向量化召回。"
+  },
   "enable_tool_read": {
     "description": "是否允许模型通过工具查询群关系记忆",
     "type": "bool",

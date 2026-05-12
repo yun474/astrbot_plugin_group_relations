@@ -76,6 +76,7 @@ function render() {
   renderHeader();
   renderGroupForm();
   renderRelations();
+  renderMembers();
   renderProfiles();
 }
 
@@ -96,7 +97,7 @@ function renderGroups() {
         <button class="group-item" data-group-id="${escapeHtml(group.id)}" aria-selected="${group.id === state.groupId}">
           <strong>${escapeHtml(group.name || group.id)}</strong>
           <span>${escapeHtml(group.id)}</span>
-          <span>${group.relation_count || 0} 关系 · ${group.profile_count || 0} 画像</span>
+          <span>${group.relation_count || 0} 关系 · ${group.profile_count || 0} 画像 · ${group.member_count || 0} 成员</span>
         </button>
       `,
     )
@@ -110,6 +111,7 @@ function renderHeader() {
     ? `
       <div class="stat"><span class="meta">关系</span><strong>${group.relation_count || 0}</strong></div>
       <div class="stat"><span class="meta">画像</span><strong>${group.profile_count || 0}</strong></div>
+      <div class="stat"><span class="meta">成员</span><strong>${group.member_count || 0}</strong></div>
       <div class="stat"><span class="meta">消息</span><strong>${group.message_count || 0}</strong></div>
     `
     : "";
@@ -132,10 +134,14 @@ function renderRelations() {
     relationRow({
       id: "",
       subject: "",
+      subject_user_id: "",
       relation: "",
       object: "",
+      object_user_id: "",
+      category: "relation",
       note: "",
       confidence: 0.8,
+      importance: 0.6,
       isNew: true,
     }),
     ...relations.map((item) => relationRow(item)),
@@ -148,16 +154,40 @@ function relationRow(item) {
   return `
     <form class="relation-row" ${idAttr}>
       ${field("主体", item.subject, "subject")}
+      ${field("主体ID", item.subject_user_id, "subject_user_id")}
       ${field("关系", item.relation, "relation")}
       ${field("客体", item.object, "object")}
+      ${field("客体ID", item.object_user_id, "object_user_id")}
+      ${field("类别", item.category || "relation", "category")}
       ${field("备注", item.note, "note")}
       ${field("可信度", item.confidence ?? 0.8, "confidence", "number")}
+      ${field("重要度", item.importance ?? 0.6, "importance", "number")}
       <div class="row-actions">
         <button class="primary" data-action="save-relation" type="submit">${item.id ? "保存" : "新增"}</button>
         ${item.id ? `<button class="danger" data-action="delete-relation" type="button">删除</button>` : ""}
       </div>
     </form>
   `;
+}
+
+function renderMembers() {
+  const list = $("#memberList");
+  const members = state.memory.members || [];
+  if (!members.length) {
+    list.innerHTML = `<div class="empty">暂无成员目录；新群首次触达后会尝试自动获取。</div>`;
+    return;
+  }
+  list.innerHTML = members
+    .map(
+      (member) => `
+        <div class="member">
+          <strong>${escapeHtml(member.display_name || member.user_id)}</strong>
+          <span>${escapeHtml(member.user_id)}</span>
+          <span>${escapeHtml(member.role || "member")}</span>
+        </div>
+      `,
+    )
+    .join("");
 }
 
 function renderProfiles() {
@@ -210,8 +240,10 @@ function factRow(profile, fact) {
   return `
     <form class="fact-row" data-profile-id="${escapeHtml(profile.id || "")}" data-index="${escapeHtml(fact.index ?? "")}">
       ${field("画像事实", fact.fact, "fact")}
+      ${field("类别", fact.category || "impression", "category")}
       ${field("证据备注", fact.note, "note")}
       ${field("可信度", fact.confidence ?? 0.8, "confidence", "number")}
+      ${field("重要度", fact.importance ?? 0.6, "importance", "number")}
       <div class="fact-actions">
         <button class="secondary" data-action="save-fact" type="submit">${fact.isNew ? "新增事实" : "保存事实"}</button>
         ${fact.isNew ? "" : `<button class="danger" data-action="delete-fact" type="button">删除事实</button>`}

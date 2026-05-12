@@ -100,7 +100,7 @@ label span,
 
 .stats {
   display: grid;
-  grid-template-columns: repeat(3, minmax(86px, 1fr));
+  grid-template-columns: repeat(4, minmax(76px, 1fr));
   gap: 8px;
   min-width: 280px;
 }
@@ -240,11 +240,30 @@ textarea:focus {
 
 .relation-row {
   display: grid;
-  grid-template-columns: 1fr 1fr 1fr minmax(160px, 1.4fr) 88px 146px;
+  grid-template-columns: repeat(3, minmax(110px, 1fr)) repeat(2, minmax(100px, 0.8fr)) minmax(160px, 1.4fr) repeat(2, 84px) 120px;
   gap: 8px;
   align-items: end;
   border-top: 1px solid var(--line);
   padding-top: 10px;
+}
+
+.members {
+  display: grid;
+  gap: 8px;
+}
+
+.member {
+  align-items: center;
+  border-top: 1px solid var(--line);
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(160px, 1fr) minmax(120px, 1fr) 88px;
+  padding-top: 8px;
+}
+
+.member span {
+  color: var(--muted);
+  overflow-wrap: anywhere;
 }
 
 .profiles {
@@ -272,7 +291,7 @@ textarea:focus {
 
 .fact-row {
   display: grid;
-  grid-template-columns: minmax(180px, 1.4fr) minmax(160px, 1fr) 88px 146px;
+  grid-template-columns: minmax(180px, 1.4fr) 120px minmax(160px, 1fr) 88px 88px 146px;
   gap: 8px;
   align-items: end;
 }
@@ -309,10 +328,11 @@ textarea:focus {
     flex-direction: column;
   }
 
-  .stats,
-  .grid.two,
-  .relation-row,
-  .profile-title,
+    .stats,
+    .grid.two,
+    .relation-row,
+    .member,
+    .profile-title,
   .fact-row {
     grid-template-columns: 1fr;
     width: 100%;

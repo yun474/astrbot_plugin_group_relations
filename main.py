@@ -59,6 +59,17 @@ def _split_config_list(value) -> set[str]:
     return set()
 
 
+def normalize_role(value) -> str:
+    role = str(value or "").strip().lower()
+    if role in {"owner", "群主", "super_admin", "superadmin"}:
+        return "owner"
+    if role in {"admin", "administrator", "管理员", "manage", "manager"}:
+        return "admin"
+    if role in {"member", "群友", "成员", "user", "normal"}:
+        return "member"
+    return role
+
+
 class GroupRelationsPlugin(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
@@ -129,6 +140,7 @@ class GroupRelationsPlugin(Star):
                     "/关系 用户 [用户ID或昵称]",
                     "/关系 画像 [用户ID或昵称]",
                     "/关系 删除画像 <用户ID或昵称> [画像关键词]",
+                    "/关系 刷新目录",
                     "/关系 调试 <查询词>",
                     "/关系 最近",
                     "/关系 向量",
@@ -181,6 +193,8 @@ class GroupRelationsPlugin(Star):
             f"群空间：{group.name or group.id}",
             f"空间ID：{group.id}",
             f"类型：{group.kind}",
+            f"群主：{group.owner_display_name or group.owner_user_id or '未知'}",
+            f"成员目录：{group.member_count} 人 / {group.member_directory_source or '未初始化'}",
             f"消息触达：{group.message_count}",
             f"关系数：{len(self.store.export_group(scope_id))}",
             f"用户画像数：{len(self.store.export_profiles(scope_id))}",
@@ -189,6 +203,29 @@ class GroupRelationsPlugin(Star):
             lines.extend(["", "最近活跃用户画像："])
             lines.extend(format_profile(profile, max_facts=2) for profile in profiles)
         yield event.plain_result("\n".join(lines))
+
+    @relations.command("刷新目录")
+    async def refresh_directory(self, event: AstrMessageEvent):
+        """刷新当前群成员目录。"""
+        if not self._can_use_debug_commands(event):
+            yield event.plain_result(self._debug_denied_message())
+            return
+        if not _is_group_event(event):
+            yield event.plain_result("当前不是群聊，不能刷新群成员目录。")
+            return
+        group = self._touch_event_scope(event)
+        await self._refresh_group_directory(event, force=True)
+        group = self.store.groups.get(group.id) or group
+        yield event.plain_result(
+            "\n".join(
+                [
+                    f"群成员目录已刷新：{group.name or group.id}",
+                    f"成员数：{group.member_count}",
+                    f"来源：{group.member_directory_source or '未知'}",
+                    f"群主：{group.owner_display_name or group.owner_user_id or '未知'}",
+                ]
+            )
+        )
 
     @relations.command("用户")
     async def user_profile(self, event: AstrMessageEvent, query: str = ""):
@@ -364,6 +401,9 @@ class GroupRelationsPlugin(Star):
             "owner_display_name": group.owner_display_name if group else "",
             "owner_evidence": group.owner_evidence if group else "",
             "owner_updated_at": group.owner_updated_at if group else 0,
+            "member_directory_updated_at": group.member_directory_updated_at if group else 0,
+            "member_directory_source": group.member_directory_source if group else "",
+            "member_count": group.member_count if group else 0,
             "created_at": group.created_at if group else 0,
             "updated_at": group.updated_at if group else 0,
             "message_count": group.message_count if group else 0,
@@ -384,6 +424,9 @@ class GroupRelationsPlugin(Star):
         profile["facts"] = facts
         return profile
 
+    def _web_member_payload(self, member: dict) -> dict:
+        return dict(member)
+
     def _web_memory_payload(self, selected_group_id: str = "") -> dict:
         self.store._ensure_groups()
         groups = [self._web_group_payload(group["id"]) for group in self.store.export_groups()]
@@ -396,6 +439,10 @@ class GroupRelationsPlugin(Star):
             self._web_profile_payload(profile)
             for profile in self.store.export_profiles(selected_group_id)
         ] if selected_group_id else []
+        members = [
+            self._web_member_payload(member)
+            for member in self.store.export_members(selected_group_id)
+        ] if selected_group_id else []
         return {
             "plugin": PLUGIN_NAME,
             "groups": groups,
@@ -403,6 +450,7 @@ class GroupRelationsPlugin(Star):
             "selected_group": selected,
             "relations": relations,
             "profiles": profiles,
+            "members": members,
         }
 
     async def web_memory(self):
@@ -435,14 +483,37 @@ class GroupRelationsPlugin(Star):
         subject = str(data.get("subject") or "").strip()
         relation = str(data.get("relation") or "").strip()
         object_ = str(data.get("object") or data.get("object_") or "").strip()
+        subject_user_id = str(data.get("subject_user_id") or "").strip()
+        object_user_id = str(data.get("object_user_id") or "").strip()
+        category = str(data.get("category") or "relation").strip()
         note = str(data.get("note") or "").strip()
+        category = str(data.get("category") or "impression").strip()
         try:
             confidence = float(data.get("confidence", 0.8))
         except (TypeError, ValueError):
             confidence = 0.8
-        text = " ".join(part for part in [subject, relation, object_, note] if part)
+        try:
+            importance = float(data.get("importance", 0.6))
+        except (TypeError, ValueError):
+            importance = 0.6
+        try:
+            importance = float(data.get("importance", 0.6))
+        except (TypeError, ValueError):
+            importance = 0.6
+        text = " ".join(part for part in [subject, subject_user_id, relation, object_, object_user_id, category, note] if part)
         if not text:
             return self._web_error("relation content is empty")
+        if (
+            self._cfg_bool("记忆写入_关系必须包含群成员ID", None, True)
+            and self.store.groups.get(group_id)
+            and self.store.groups[group_id].kind == "group"
+            and not (subject_user_id or object_user_id)
+        ):
+            return self._web_error("relation requires subject_user_id or object_user_id in group spaces")
+        if subject_user_id and not self._web_can_use_group_user(group_id, subject_user_id):
+            return self._web_error(f"subject_user_id `{subject_user_id}` is not in this group member directory")
+        if object_user_id and not self._web_can_use_group_user(group_id, object_user_id):
+            return self._web_error(f"object_user_id `{object_user_id}` is not in this group member directory")
         vector, provider_id = await self._embed(text)
         if relation_id_:
             updated = self.store.update(
@@ -451,8 +522,12 @@ class GroupRelationsPlugin(Star):
                 subject=subject or None,
                 relation=relation or None,
                 object_=object_ or None,
+                subject_user_id=subject_user_id,
+                object_user_id=object_user_id,
+                category=category,
                 note=note,
                 confidence=confidence,
+                importance=importance,
                 vector=vector,
                 embedding_provider_id=provider_id,
             )
@@ -466,9 +541,13 @@ class GroupRelationsPlugin(Star):
                 subject=subject,
                 relation=relation,
                 object_=object_,
+                subject_user_id=subject_user_id,
+                object_user_id=object_user_id,
+                category=category,
                 note=note,
                 source="webui",
                 confidence=confidence,
+                importance=importance,
                 vector=vector,
                 embedding_provider_id=provider_id,
             )
@@ -483,6 +562,16 @@ class GroupRelationsPlugin(Star):
         if not self.store.delete(relation_id_, group_id=group_id):
             return self._web_error("relation not found", 404)
         return self._web_ok(memory=self._web_memory_payload(group_id))
+
+    def _web_can_use_group_user(self, group_id: str, user_id: str) -> bool:
+        group = self.store.groups.get(group_id)
+        if not group or group.kind != "group":
+            return True
+        if not self._cfg_bool("群成员目录_写入时校验", None, True):
+            return True
+        if not self.store.member_directory_ready(group_id):
+            return False
+        return self.store.has_member(group_id, user_id)
 
     async def web_profile_save(self):
         data = await self._web_request_json()
@@ -515,6 +604,8 @@ class GroupRelationsPlugin(Star):
         else:
             if not user_id:
                 return self._web_error("user_id is required")
+            if not self._web_can_use_group_user(group_id, user_id):
+                return self._web_error(f"user_id `{user_id}` is not in this group member directory")
             profile = self.store.touch_profile(group_id, user_id, display_name or user_id)
             self.store.update_profile(
                 profile.id,
@@ -553,6 +644,8 @@ class GroupRelationsPlugin(Star):
                 note=note,
                 source="webui",
                 confidence=confidence,
+                category=category,
+                importance=importance,
             )
             self._trim_profile_facts(profile)
         else:
@@ -567,6 +660,8 @@ class GroupRelationsPlugin(Star):
                 fact=fact,
                 note=note,
                 confidence=confidence,
+                category=category,
+                importance=importance,
             ):
                 return self._web_error("fact not found", 404)
         return self._web_ok(memory=self._web_memory_payload(group_id))
@@ -607,7 +702,7 @@ class GroupRelationsPlugin(Star):
         top_k = max(0, self._cfg_int("记忆管理_每轮注入关系数量", "injection_top_k", 5))
         matches = []
         if top_k > 0:
-            matches = await self._search_relations(event, query, limit=top_k)
+            matches = await self._search_relations(event, query, user_id=_sender_id(event), limit=top_k)
         if not matches and not self.store.get_profile(self._scope_id(event), _sender_id(event)):
             return
         text = self._build_injection_text(event, matches)
@@ -669,7 +764,7 @@ class GroupRelationsPlugin(Star):
         self._summary_buffers[scope_id] = []
 
     @filter.llm_tool(name="group_relation_search")
-    async def group_relation_search(self, event: AstrMessageEvent, query: str):
+    async def group_relation_search(self, event: AstrMessageEvent, query: str = "", user_id: str = ""):
         """优先在当前群空间查询人物关系记忆；配置允许时会补充同一用户其他群空间的结果。
 
         使用场景：
@@ -682,13 +777,14 @@ class GroupRelationsPlugin(Star):
         - 没查到就说明记忆不足，不要自行补全。
 
         Args:
-            query(string): 人名、昵称、用户ID、关系、事件或自然语言问题。
+            query(string): 人名、昵称、关系、事件或自然语言问题；不知道 user_id 时使用。
+            user_id(string): 优先按群成员用户 ID 精确召回此人的关系；知道 ID 时优先填写。
         """
         if not bool(self.config.get("enable_tool_read", True)):
             yield event.plain_result("群关系记忆查询工具当前未启用。")
             return
         self._touch_event_scope(event)
-        matches = await self._search_relations(event, query)
+        matches = await self._search_relations(event, query or user_id or _sender_id(event), user_id=user_id)
         if not matches:
             yield event.plain_result(f"没有找到和「{query}」相关的群关系记忆。")
             return
@@ -696,7 +792,7 @@ class GroupRelationsPlugin(Star):
         yield event.plain_result("\n".join(lines))
 
     @filter.llm_tool(name="group_user_profile_search")
-    async def group_user_profile_search(self, event: AstrMessageEvent, query: str = ""):
+    async def group_user_profile_search(self, event: AstrMessageEvent, query: str = "", user_id: str = ""):
         """优先在当前群空间查询用户画像；配置允许时会补充同一用户其他群空间的结果。
 
         使用场景：
@@ -709,22 +805,28 @@ class GroupRelationsPlugin(Star):
         - 不要把画像事实扩展成未记录的隐私、评价或推测。
 
         Args:
-            query(string): 用户 ID、昵称、群名片或画像关键词；留空查询当前发言人。
+            query(string): 昵称、群名片或画像关键词；留空查询当前发言人。
+            user_id(string): 优先按用户 ID 精确查询；知道 ID 时优先填写。
         """
         if not bool(self.config.get("enable_tool_read", True)):
             yield event.plain_result("群用户画像查询工具当前未启用。")
             return
         self._touch_event_scope(event)
         allow_cross_group = self._cfg_bool("记忆隔离_允许跨群召回", None, True)
-        profiles = self.store.find_profiles(
-            self._scope_id(event),
-            query=query or _sender_id(event),
-            limit=self._cfg_int("记忆管理_画像查询返回人数", "max_profile_results", 5),
-        )
+        lookup_user_id = str(user_id or "").strip()
+        if lookup_user_id:
+            profile = self.store.find_profile_by_user_id(self._scope_id(event), lookup_user_id)
+            profiles = [profile] if profile else []
+        else:
+            profiles = self.store.find_profiles(
+                self._scope_id(event),
+                query=query or _sender_id(event),
+                limit=self._cfg_int("记忆管理_画像查询返回人数", "max_profile_results", 5),
+            )
         if allow_cross_group:
             profiles = self._cross_group_profiles(
-                _sender_id(event),
-                query or _sender_id(event),
+                lookup_user_id or _sender_id(event),
+                lookup_user_id or query or _sender_id(event),
                 profiles,
                 self._scope_id(event),
             )
@@ -740,8 +842,12 @@ class GroupRelationsPlugin(Star):
         subject: str,
         relation: str,
         object_: str,
+        subject_user_id: str = "",
+        object_user_id: str = "",
+        category: str = "relation",
         note: str = "",
         confidence: float = 0.8,
+        importance: float = 0.6,
     ):
         """写入当前群空间内一条明确、稳定、可复用的人物关系记忆。
 
@@ -756,22 +862,42 @@ class GroupRelationsPlugin(Star):
             subject(string): 关系主体，例如人名、昵称、群成员、组织。
             relation(string): 关系类型，例如朋友、同学、管理员、常一起玩、合作、敌对。
             object_(string): 关系客体，例如另一个人名、昵称、群成员、组织。
+            subject_user_id(string): 主体是群成员时填写其用户 ID；不知道可留空。
+            object_user_id(string): 客体是群成员时填写其用户 ID；不知道可留空。
+            category(string): 关系类别，如 relationship / role / preference / memory / correction。
             note(string): 补充说明或证据摘要，没有可以留空。
             confidence(number): 关系可信度，0 到 1 之间。
+            importance(number): 长期重要度，0 到 1 之间；普通小事不要高于 0.5。
         """
         if not bool(self.config.get("enable_tool_write", False)):
             yield event.plain_result("群关系记忆写入工具当前未启用。")
             return
         self._touch_event_scope(event)
         confidence = max(0.0, min(1.0, float(confidence)))
+        importance = max(0.0, min(1.0, float(importance)))
+        ok, reason = await self._validate_relation_users_for_write(
+            event,
+            subject_user_id=subject_user_id,
+            object_user_id=object_user_id,
+        )
+        if not ok:
+            yield event.plain_result(reason)
+            return
+        if not self._is_relation_worth_storing(subject, relation, object_, note, confidence, importance, "tool"):
+            yield event.plain_result("这条关系太像临时闲聊或低价值小事，已拒绝写入。")
+            return
         record = await self._remember_relation(
             group_id=self._scope_id(event),
             subject=subject,
             relation=relation,
             object_=object_,
+            subject_user_id=subject_user_id,
+            object_user_id=object_user_id,
+            category=category,
             note=note,
             source="tool",
             confidence=confidence,
+            importance=importance,
         )
         self._sync_private_profile_if_needed(event)
         yield event.plain_result(f"已写入群关系记忆：{format_record(record)}")
@@ -785,6 +911,8 @@ class GroupRelationsPlugin(Star):
         display_name: str = "",
         note: str = "",
         confidence: float = 0.8,
+        category: str = "impression",
+        importance: float = 0.6,
     ):
         """写入当前群空间内某个用户的稳定画像事实。
 
@@ -801,19 +929,31 @@ class GroupRelationsPlugin(Star):
             display_name(string): 用户昵称或群名片，不知道可留空。
             note(string): 证据摘要，没有可以留空。
             confidence(number): 可信度，0 到 1 之间。
+            category(string): 画像类别，如 identity / preference / impression / memory / correction。
+            importance(number): 长期重要度，0 到 1 之间；普通小事不要高于 0.5。
         """
         if not bool(self.config.get("enable_tool_write", False)):
             yield event.plain_result("群用户画像写入工具当前未启用。")
             return
         self._touch_event_scope(event)
+        target_user_id = str(user_id or _sender_id(event))
+        ok, reason = await self._validate_group_user_for_write(event, target_user_id, display_name or _sender_name(event))
+        if not ok:
+            yield event.plain_result(reason)
+            return
+        if not self._is_profile_fact_worth_storing(fact, note, confidence, importance, "tool"):
+            yield event.plain_result("这条画像太像临时闲聊或低价值小事，已拒绝写入。")
+            return
         profile = self.store.remember_profile_fact(
             group_id=self._scope_id(event),
-            user_id=str(user_id or _sender_id(event)),
+            user_id=target_user_id,
             display_name=display_name or _sender_name(event),
             fact=fact,
             note=note,
             source="tool",
             confidence=max(0.0, min(1.0, float(confidence))),
+            category=category,
+            importance=max(0.0, min(1.0, float(importance))),
         )
         self._trim_profile_facts(profile)
         self._sync_private_profile_if_needed(event)
@@ -827,8 +967,12 @@ class GroupRelationsPlugin(Star):
         subject: str = "",
         relation: str = "",
         object_: str = "",
+        subject_user_id: str = "",
+        object_user_id: str = "",
+        category: str = "",
         note: str = "",
         confidence: float = -1.0,
+        importance: float = -1.0,
     ):
         """根据用户明确纠正，修改一条当前群空间内的人物关系记忆。
 
@@ -840,8 +984,12 @@ class GroupRelationsPlugin(Star):
             subject(string): 新主体，不改则留空。
             relation(string): 新关系，不改则留空。
             object_(string): 新客体，不改则留空。
+            subject_user_id(string): 新主体用户 ID，不改则留空。
+            object_user_id(string): 新客体用户 ID，不改则留空。
+            category(string): 新类别，不改则留空。
             note(string): 新补充说明，不改则留空。
             confidence(number): 新可信度，0 到 1；不改传 -1。
+            importance(number): 新长期重要度，0 到 1；不改传 -1。
         """
         if not bool(self.config.get("enable_tool_update", False)):
             yield event.plain_result("群关系记忆修改工具当前未启用。")
@@ -854,8 +1002,18 @@ class GroupRelationsPlugin(Star):
         new_subject = subject or old.subject
         new_relation = relation or old.relation
         new_object = object_ or old.object
+        new_subject_user_id = subject_user_id or old.subject_user_id
+        new_object_user_id = object_user_id or old.object_user_id
+        ok, reason = await self._validate_relation_users_for_write(
+            event,
+            subject_user_id=new_subject_user_id,
+            object_user_id=new_object_user_id,
+        )
+        if not ok:
+            yield event.plain_result(reason)
+            return
         new_note = note if note else old.note
-        text = " ".join(part for part in [new_subject, new_relation, new_object, new_note] if part)
+        text = " ".join(part for part in [new_subject, new_subject_user_id, new_relation, new_object, new_object_user_id, new_note] if part)
         vector, provider_id = await self._embed(text)
         updated = self.store.update(
             relation_id,
@@ -863,8 +1021,12 @@ class GroupRelationsPlugin(Star):
             subject=subject or None,
             relation=relation or None,
             object_=object_ or None,
+            subject_user_id=subject_user_id if subject_user_id else None,
+            object_user_id=object_user_id if object_user_id else None,
+            category=category if category else None,
             note=note if note else None,
             confidence=None if confidence < 0 else confidence,
+            importance=None if importance < 0 else importance,
             vector=vector,
             embedding_provider_id=provider_id,
         )
@@ -923,27 +1085,96 @@ class GroupRelationsPlugin(Star):
         subject: str,
         relation: str,
         object_: str,
+        subject_user_id: str = "",
+        object_user_id: str = "",
+        category: str = "relation",
         note: str = "",
         source: str = "manual",
         confidence: float = 1.0,
+        importance: float = 0.6,
     ) -> RelationRecord:
         await self._maybe_reembed_records()
-        text = " ".join(part for part in [subject, relation, object_, note] if part)
+        text = " ".join(part for part in [subject, subject_user_id, relation, object_, object_user_id, category, note] if part)
         vector, provider_id = await self._embed(text)
         return self.store.upsert(
             group_id=group_id,
             subject=subject,
             relation=relation,
             object_=object_,
+            subject_user_id=subject_user_id,
+            object_user_id=object_user_id,
+            category=category,
             note=note,
             source=source,
             confidence=confidence,
+            importance=importance,
             vector=vector,
             embedding_provider_id=provider_id,
         )
 
     def _debug_denied_message(self) -> str:
         return "这个调试指令会暴露群关系记忆，当前只允许配置里的管理员使用。"
+
+    def _is_low_value_text(self, text: str) -> bool:
+        text = str(text or "").strip()
+        if len(text) < self._cfg_int("记忆写入_最小事实长度", None, 8):
+            return True
+        lowered = text.lower()
+        low_value_markers = [
+            "哈哈",
+            "笑死",
+            "草",
+            "在吗",
+            "谢谢",
+            "好的",
+            "今天",
+            "刚才",
+            "现在",
+            "一会儿",
+            "吃饭",
+            "睡觉",
+            "上线",
+            "下线",
+        ]
+        return any(marker in lowered for marker in low_value_markers) and len(text) < 18
+
+    def _is_profile_fact_worth_storing(
+        self,
+        fact: str,
+        note: str,
+        confidence: float,
+        importance: float,
+        source: str,
+    ) -> bool:
+        if source in {"manual", "webui"}:
+            return bool(str(fact or "").strip())
+        threshold = self._cfg_float("记忆写入_写入重要度阈值", None, 0.55)
+        if confidence < self._cfg_float("记忆管理_写入可信度阈值", None, 0.65):
+            return False
+        if importance < threshold:
+            return False
+        text = " ".join(part for part in [fact, note] if part)
+        return not self._is_low_value_text(text)
+
+    def _is_relation_worth_storing(
+        self,
+        subject: str,
+        relation: str,
+        object_: str,
+        note: str,
+        confidence: float,
+        importance: float,
+        source: str,
+    ) -> bool:
+        if source in {"manual", "webui"}:
+            return bool(subject and relation and object_)
+        threshold = self._cfg_float("记忆写入_写入重要度阈值", None, 0.55)
+        if confidence < self._cfg_float("记忆管理_写入可信度阈值", None, 0.65):
+            return False
+        if importance < threshold:
+            return False
+        text = " ".join(part for part in [subject, relation, object_, note] if part)
+        return not self._is_low_value_text(text)
 
     def _format_profile_query_result(self, event: AstrMessageEvent, query: str = "") -> str:
         self._touch_event_scope(event)
@@ -984,6 +1215,7 @@ class GroupRelationsPlugin(Star):
                 return group
         group_name = _group_name(event)
         kind = "group" if _is_group_event(event) else "private"
+        was_new_group = scope_id not in self.store.groups
         existing_profile = self.store.get_profile(scope_id, _sender_id(event))
         group_role = ""
         role_evidence = ""
@@ -1007,6 +1239,14 @@ class GroupRelationsPlugin(Star):
             group_role=group_role,
             role_evidence=role_evidence,
         )
+        if kind == "group":
+            self.store.upsert_group_member(
+                scope_id,
+                _sender_id(event),
+                _sender_name(event),
+                group_role or "member",
+                role_evidence or "event message",
+            )
         if group_role == "owner" and not group.owner_user_id:
             self.store.set_group_owner(
                 scope_id,
@@ -1014,10 +1254,18 @@ class GroupRelationsPlugin(Star):
                 _sender_name(event),
                 role_evidence or "group role initialization",
             )
+        if kind == "group" and (
+            was_new_group
+            or (not group.member_directory_updated_at and self._cfg_bool("群成员目录_初始化获取", None, True))
+        ):
+            self._schedule_group_directory_refresh(event)
         event.set_extra("group_relation_scope_touched", True)
         return group
 
     def _resolve_sender_group_role(self, event: AstrMessageEvent) -> tuple[str, str]:
+        role_value = normalize_role(getattr(event, "role", ""))
+        if role_value in {"owner", "admin", "member"}:
+            return role_value, "event.role"
         for attr_name, role in (
             ("is_super_admin", "owner"),
             ("is_group_owner", "owner"),
@@ -1033,6 +1281,159 @@ class GroupRelationsPlugin(Star):
             if matched:
                 return role, f"event.{attr_name}"
         return "member", "group message initialization"
+
+    def _schedule_group_directory_refresh(self, event: AstrMessageEvent) -> None:
+        if event.get_extra("group_relation_directory_refresh_scheduled", False):
+            return
+        event.set_extra("group_relation_directory_refresh_scheduled", True)
+        try:
+            asyncio.create_task(self._refresh_group_directory(event, force=False))
+        except RuntimeError:
+            logger.warning("group relation cannot schedule group member directory refresh: no running event loop")
+
+    async def _validate_group_user_for_write(
+        self,
+        event: AstrMessageEvent,
+        user_id: str,
+        display_name: str = "",
+    ) -> tuple[bool, str]:
+        user_id = str(user_id or "").strip()
+        if not user_id:
+            return False, "缺少 user_id，不能写入群用户画像。"
+        if not _is_group_event(event) or not self._cfg_bool("群成员目录_写入时校验", None, True):
+            return True, ""
+        group_id = self._scope_id(event)
+        if self.store.has_member(group_id, user_id):
+            return True, ""
+        await self._refresh_group_directory(event, force=True)
+        if self.store.has_member(group_id, user_id):
+            return True, ""
+        if user_id == _sender_id(event):
+            self.store.upsert_group_member(group_id, user_id, display_name or _sender_name(event), "member", "event fallback")
+            return True, ""
+        return False, f"user_id `{user_id}` 不在当前群成员目录里，刷新目录后仍未找到，已拒绝写入。"
+
+    async def _validate_relation_users_for_write(
+        self,
+        event: AstrMessageEvent,
+        subject_user_id: str = "",
+        object_user_id: str = "",
+    ) -> tuple[bool, str]:
+        user_ids = [value for value in [subject_user_id.strip(), object_user_id.strip()] if value]
+        if (
+            _is_group_event(event)
+            and self._cfg_bool("记忆写入_关系必须包含群成员ID", None, True)
+            and not user_ids
+        ):
+            return False, "关系记忆至少要包含一个群成员 user_id，避免把非本群人物写进群空间。"
+        for user_id in user_ids:
+            ok, reason = await self._validate_group_user_for_write(event, user_id)
+            if not ok:
+                return ok, reason
+        return True, ""
+
+    async def _refresh_group_directory(self, event: AstrMessageEvent, force: bool = False) -> None:
+        if not _is_group_event(event):
+            return
+        group_id = self._scope_id(event)
+        group = self.store.groups.get(group_id)
+        if (
+            group
+            and group.member_directory_updated_at
+            and not force
+            and int(group.member_directory_updated_at) > 0
+        ):
+            return
+        members = await self._fetch_group_member_directory(event)
+        if members:
+            self.store.replace_group_members(group_id, members, source="platform")
+            for item in members:
+                role = normalize_role(item.get("role", "member"))
+                if role in {"owner", "admin"}:
+                    self.store.touch_profile(
+                        group_id,
+                        str(item.get("user_id") or ""),
+                        str(item.get("display_name") or item.get("nickname") or item.get("card") or ""),
+                        role,
+                        "platform member directory",
+                    )
+            owner = next((item for item in members if normalize_role(item.get("role", "")) == "owner"), None)
+            if owner:
+                self.store.set_group_owner(
+                    group_id,
+                    str(owner.get("user_id") or ""),
+                    str(owner.get("display_name") or owner.get("nickname") or owner.get("card") or ""),
+                    "platform member directory",
+                )
+            return
+        self.store.upsert_group_member(
+            group_id,
+            _sender_id(event),
+            _sender_name(event),
+            self._resolve_sender_group_role(event)[0],
+            "event fallback",
+        )
+        self.store.refresh_member_directory_metadata(group_id, "event_fallback_seen_only")
+
+    async def _fetch_group_member_directory(self, event: AstrMessageEvent) -> list[dict]:
+        group_id = _group_id(event)
+        if not group_id:
+            return []
+        raw = await self._call_platform_action(event, "get_group_member_list", {"group_id": group_id})
+        items = self._extract_action_data(raw)
+        if not isinstance(items, list):
+            return []
+        members = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            user_id = str(item.get("user_id") or item.get("id") or "").strip()
+            if not user_id:
+                continue
+            display_name = str(item.get("card") or item.get("nickname") or item.get("name") or user_id).strip()
+            members.append(
+                {
+                    "user_id": user_id,
+                    "display_name": display_name,
+                    "role": normalize_role(item.get("role", "member")),
+                }
+            )
+        return members
+
+    async def _call_platform_action(self, event: AstrMessageEvent, action: str, params: dict):
+        bot = getattr(event, "bot", None)
+        api = getattr(bot, "api", None)
+        call_action = getattr(api, "call_action", None)
+        if not callable(call_action):
+            return None
+        group_id = params.get("group_id")
+        candidates = [params]
+        if isinstance(group_id, str) and group_id.isdigit():
+            converted = dict(params)
+            converted["group_id"] = int(group_id)
+            candidates.append(converted)
+        for candidate in candidates:
+            for mode in ("kwargs", "dict"):
+                try:
+                    if mode == "kwargs":
+                        result = call_action(action, **candidate)
+                    else:
+                        result = call_action(action, candidate)
+                    if hasattr(result, "__await__"):
+                        result = await result
+                    if result is not None:
+                        return result
+                except Exception as exc:
+                    logger.debug(f"group relation platform action `{action}` failed via {mode}: {exc}")
+        return None
+
+    def _extract_action_data(self, raw):
+        if isinstance(raw, dict):
+            if "data" in raw:
+                return raw["data"]
+            if "retcode" in raw and "result" in raw:
+                return raw["result"]
+        return raw
 
     def _sync_private_profile_if_needed(self, event: AstrMessageEvent) -> None:
         if _is_group_event(event):
@@ -1105,22 +1506,36 @@ class GroupRelationsPlugin(Star):
         self,
         event: AstrMessageEvent,
         query: str,
+        user_id: str = "",
         limit: int | None = None,
     ) -> list[tuple[RelationRecord, float]]:
         await self._maybe_reembed_records()
         limit = limit or int(self.config.get("max_query_results", 8))
+        lookup_user_id = str(user_id or "").strip()
+        if lookup_user_id:
+            matches = [(record, 1.0) for record in self.store.by_user_id(self._scope_id(event), lookup_user_id, limit=limit)]
+            return self._cross_group_relation_fallback(
+                event,
+                query or lookup_user_id,
+                self._cap_speaker_relations(event, matches),
+                limit,
+                user_id=lookup_user_id,
+            )
         threshold = float(self.config.get("similarity_threshold", 0.12))
-        vector, _provider_id = await self._embed(query)
-        if not vector:
+        if self._cfg_bool("召回_优先使用用户ID和文本", None, True):
             matches = self.store.search_by_text(self._scope_id(event), query, limit=limit)
             return self._cross_group_relation_fallback(event, query, self._cap_speaker_relations(event, matches), limit)
-        matches = self.store.search_by_vector(
-            self._scope_id(event),
-            query,
-            vector,
-            limit=limit,
-            threshold=threshold,
-        )
+        vector, _provider_id = await self._embed(query)
+        if vector:
+            matches = self.store.search_by_vector(
+                self._scope_id(event),
+                query,
+                vector,
+                limit=limit,
+                threshold=threshold,
+            )
+        else:
+            matches = self.store.search_by_text(self._scope_id(event), query, limit=limit)
         return self._cross_group_relation_fallback(event, query, self._cap_speaker_relations(event, matches), limit)
 
     def _cross_group_relation_fallback(
@@ -1129,6 +1544,7 @@ class GroupRelationsPlugin(Star):
         query: str,
         matches: list[tuple[RelationRecord, float]],
         limit: int,
+        user_id: str = "",
     ) -> list[tuple[RelationRecord, float]]:
         if not self._cfg_bool("记忆隔离_允许跨群召回", None, True):
             return matches
@@ -1136,10 +1552,15 @@ class GroupRelationsPlugin(Star):
             return matches[:limit]
         seen = {record.id for record, _score in matches}
         merged = list(matches)
-        for group in self.store.find_user_groups(_sender_id(event)):
+        for group in self.store.find_user_groups(user_id or _sender_id(event)):
             if group.id == self._scope_id(event):
                 continue
-            for record, score in self.store.search_by_text(group.id, query, limit=limit):
+            cross_records = (
+                [(record, 1.0) for record in self.store.by_user_id(group.id, user_id, limit=limit)]
+                if user_id
+                else self.store.search_by_text(group.id, query, limit=limit)
+            )
+            for record, score in cross_records:
                 if record.id in seen:
                     continue
                 seen.add(record.id)
@@ -1288,6 +1709,7 @@ class GroupRelationsPlugin(Star):
                     f"- 类型: {group.kind}",
                     f"- 群主: {owner}",
                     f"- 群主来源: {group.owner_evidence or '未记录'}",
+                    f"- 群成员目录: {group.member_count} 人，来源 {group.member_directory_source or '未初始化'}",
                     f"- 已触达消息数: {group.message_count}",
                     f"- 已记录关系数: {len(self.store.export_group(scope_id))}",
                     f"- 已记录用户画像数: {len(self.store.export_profiles(scope_id))}",
@@ -1307,8 +1729,8 @@ class GroupRelationsPlugin(Star):
         lines.extend(
             [
                 "",
-                "如果用户询问人物关系但以上信息不足，可以主动调用 group_relation_search。",
-                "如果用户询问群内某人的画像但以上信息不足，可以主动调用 group_user_profile_search。",
+                "如果用户询问人物关系但以上信息不足，可以主动调用 group_relation_search；知道用户ID时必须传 user_id。",
+                "如果用户询问群内某人的画像但以上信息不足，可以主动调用 group_user_profile_search；知道用户ID时必须传 user_id。",
                 "只有当用户明确提供稳定事实或明确纠正时，才在开关允许时写入/修改/删除记忆。",
                 "画像写入使用 group_user_profile_remember；关系写入/修改/删除使用 group_relation_remember / group_relation_update / group_relation_delete。",
                 "</group_relation_context>",
@@ -1349,8 +1771,8 @@ class GroupRelationsPlugin(Star):
         related = []
         seen = {sender_id}
         for record, _score in matches:
-            for name in (record.subject, record.object):
-                for profile in self.store.find_profiles(scope_id, query=name, limit=2):
+            for key in (record.subject_user_id, record.object_user_id, record.subject, record.object):
+                for profile in self.store.find_profiles(scope_id, query=key, limit=2):
                     if profile.user_id in seen or profile.id in seen:
                         continue
                     related.append(profile)
@@ -1385,9 +1807,16 @@ class GroupRelationsPlugin(Star):
                 break
             record_subject = record.subject.lower()
             record_object = record.object.lower()
+            record_subject_user_id = record.subject_user_id.lower()
+            record_object_user_id = record.object_user_id.lower()
             if (person_norm and (
                 person_norm in record.subject.lower() or person_norm in record.object.lower()
-            )) or (user_id and (user_id in record_subject or user_id in record_object)):
+            )) or (user_id and (
+                user_id in record_subject
+                or user_id in record_object
+                or user_id in record_subject_user_id
+                or user_id in record_object_user_id
+            )):
                 facts.append(format_record(record, with_id=False))
         return "；".join(facts)
 
@@ -1528,6 +1957,7 @@ class GroupRelationsPlugin(Star):
     ) -> None:
         item_type = str(item.get("type") or "relation").strip().lower()
         confidence = float(item.get("confidence", default_confidence))
+        importance = float(item.get("importance", 0.6))
         threshold = self._cfg_float("记忆管理_写入可信度阈值", None, 0.65)
         if confidence < threshold:
             return
@@ -1535,11 +1965,24 @@ class GroupRelationsPlugin(Star):
             user_id = str(item.get("user_id") or _sender_id(event)).strip()
             display_name = str(item.get("display_name") or item.get("subject") or _sender_name(event)).strip()
             fact = str(item.get("fact") or "").strip()
+            category = str(item.get("category") or "impression").strip()
             if not fact:
                 relation = str(item.get("relation") or "").strip()
                 object_ = str(item.get("object") or "").strip()
                 fact = " ".join(part for part in [relation, object_] if part).strip()
             if not fact:
+                return
+            ok, reason = await self._validate_group_user_for_write(event, user_id, display_name)
+            if not ok:
+                logger.info(f"group relation skipped profile memory: {reason}")
+                return
+            if not self._is_profile_fact_worth_storing(
+                fact,
+                str(item.get("note") or ""),
+                confidence,
+                importance,
+                source,
+            ):
                 return
             profile = self.store.remember_profile_fact(
                 group_id=self._scope_id(event),
@@ -1549,17 +1992,43 @@ class GroupRelationsPlugin(Star):
                 note=str(item.get("note") or ""),
                 source=source,
                 confidence=confidence,
+                category=category,
+                importance=importance,
             )
             self._trim_profile_facts(profile)
+            return
+        subject_user_id = str(item.get("subject_user_id") or "").strip()
+        object_user_id = str(item.get("object_user_id") or "").strip()
+        ok, reason = await self._validate_relation_users_for_write(
+            event,
+            subject_user_id=subject_user_id,
+            object_user_id=object_user_id,
+        )
+        if not ok:
+            logger.info(f"group relation skipped relation memory: {reason}")
+            return
+        if not self._is_relation_worth_storing(
+            str(item.get("subject") or ""),
+            str(item.get("relation") or ""),
+            str(item.get("object") or ""),
+            str(item.get("note") or ""),
+            confidence,
+            importance,
+            source,
+        ):
             return
         await self._remember_relation(
             group_id=self._scope_id(event),
             subject=item["subject"],
             relation=item["relation"],
             object_=item["object"],
+            subject_user_id=subject_user_id,
+            object_user_id=object_user_id,
+            category=str(item.get("category") or "relation"),
             note=item.get("note", ""),
             source=source,
             confidence=confidence,
+            importance=importance,
         )
 
     def _trim_profile_facts(self, profile) -> None:
@@ -1579,18 +2048,20 @@ class GroupRelationsPlugin(Star):
 
 可输出两类元素。
 
-1. 关系记忆：用于描述两个人/组织/群体之间的稳定关系。
-{{"type":"relation","subject":"人物A","relation":"关系","object":"人物B","note":"补充信息","confidence":0.0到1.0}}
+1. 关系记忆：用于描述群成员之间的稳定关系，至少要有一个群成员 user_id。
+{{"type":"relation","subject":"人物A","subject_user_id":"群成员A的ID或空","relation":"关系","object":"人物B","object_user_id":"群成员B的ID或空","category":"relationship/role/preference/memory/correction","note":"证据摘要","confidence":0.0到1.0,"importance":0.0到1.0}}
 
 2. 用户画像：用于描述某个群友在当前群空间内的稳定身份、别名、偏好或长期特征。
-{{"type":"profile","user_id":"{_sender_id(event)}","display_name":"{_sender_name(event)}","fact":"稳定画像事实","note":"证据摘要","confidence":0.0到1.0}}
+{{"type":"profile","user_id":"{_sender_id(event)}","display_name":"{_sender_name(event)}","category":"identity/preference/impression/memory/correction","fact":"稳定画像事实","note":"证据摘要","confidence":0.0到1.0,"importance":0.0到1.0}}
 
 抽取规则：
 1. 只能抽取消息字面明确表达、当前发言人自述、或被明确确认的事实。
 2. 对“我/本人/咱”这类指代，若指当前发言人，画像必须使用当前发言人的 user_id 和 display_name。
-3. 关系的 subject/object 可以是人名、昵称、用户ID、组织、群体；画像必须尽量落到具体 user_id。
-4. 不记录一次性闲聊、玩笑、辱骂、情绪评价、敏感隐私、猜测、反问或未确认传闻。
-5. 不能确定时输出 []。
+3. 关系若涉及当前发言人，必须填写当前发言人的 user_id；不能确定群成员 ID 时不要输出该关系。
+4. 只保留长期有用信息：群身份、稳定关系、明确偏好、长期习惯、用户要求记住的内容、纠错后的事实。
+5. 不记录一次性闲聊、玩笑、辱骂、情绪评价、当天行程、临时状态、敏感隐私、猜测、反问或未确认传闻。
+6. importance 表示之后水群时是否经常有用；小事低于 0.55，低于 0.55 的内容不要输出。
+7. 不能确定时输出 []。
 
 消息：
 {message}
@@ -1618,19 +2089,22 @@ class GroupRelationsPlugin(Star):
 
 可输出两类元素。
 
-1. 关系记忆：描述两个人/组织/群体之间的稳定关系。
-{{"type":"relation","subject":"人物A","relation":"关系","object":"人物B/群/组织","note":"证据摘要","confidence":0.0到1.0}}
+1. 关系记忆：描述群成员之间或群成员与组织/群体之间的稳定关系，至少要有一个群成员 user_id。
+{{"type":"relation","subject":"人物A","subject_user_id":"群成员A的ID或空","relation":"关系","object":"人物B/群/组织","object_user_id":"群成员B的ID或空","category":"relationship/role/preference/memory/correction","note":"证据摘要","confidence":0.0到1.0,"importance":0.0到1.0}}
 
 2. 用户画像：描述某个群友在当前群空间内的稳定身份、别名、偏好、长期兴趣、常见互动对象或已确认背景。
-{{"type":"profile","user_id":"用户ID","display_name":"昵称或群名片","fact":"稳定画像事实","note":"证据摘要","confidence":0.0到1.0}}
+{{"type":"profile","user_id":"用户ID","display_name":"昵称或群名片","category":"identity/preference/impression/memory/correction","fact":"稳定画像事实","note":"证据摘要","confidence":0.0到1.0,"importance":0.0到1.0}}
 
 抽取规则：
 1. 只抽取对话明确表达、用户自述、管理员确认或用户纠正后的事实。
 2. 用户纠正机器人时，以用户纠正为准；可以输出新的正确事实，但不要保留被纠正的旧说法。
 3. 对“我/本人/咱/楼上/他”等指代，只有能从对话行里的昵称和ID确定对象时才抽取。
-4. 用户画像必须尽量填写 user_id；无法确定 user_id 时不要输出 profile。
-5. 不记录一次性闲聊、玩笑、攻击性评价、敏感隐私、推测、谣言、未确认关系。
-6. 没有值得记忆的内容时输出 []。
+4. 用户画像必须填写 user_id；无法确定 user_id 时不要输出 profile。
+5. 关系记忆至少填写 subject_user_id 或 object_user_id；无法确认任一群成员 ID 时不要输出 relation。
+6. 只保留长期有用信息：群身份、稳定关系、明确偏好、长期习惯、用户要求记住的内容、纠错后的事实。
+7. 不记录一次性闲聊、玩笑、攻击性评价、当天行程、临时状态、敏感隐私、推测、谣言、未确认关系。
+8. importance 表示之后水群时是否经常有用；小事低于 0.55，低于 0.55 的内容不要输出。
+9. 没有值得记忆的内容时输出 []。
 
 最近对话：
 {dialogue}
@@ -1657,6 +2131,10 @@ class GroupRelationsPlugin(Star):
                 confidence = float(item.get("confidence", 0.65))
             except (TypeError, ValueError):
                 confidence = 0.65
+            try:
+                importance = float(item.get("importance", 0.6))
+            except (TypeError, ValueError):
+                importance = 0.6
             if item_type == "profile":
                 fact = str(item.get("fact") or "").strip()
                 if not fact:
@@ -1670,25 +2148,33 @@ class GroupRelationsPlugin(Star):
                         "type": "profile",
                         "user_id": str(item.get("user_id") or "").strip()[:80],
                         "display_name": str(item.get("display_name") or item.get("subject") or "").strip()[:80],
+                        "category": str(item.get("category") or "impression").strip()[:40],
                         "fact": fact[:160],
                         "note": note[:240],
                         "confidence": max(0.0, min(1.0, confidence)),
+                        "importance": max(0.0, min(1.0, importance)),
                     }
                 )
                 continue
             subject = str(item.get("subject") or "").strip()
             relation = str(item.get("relation") or "").strip()
             object_ = str(item.get("object") or "").strip()
+            subject_user_id = str(item.get("subject_user_id") or "").strip()
+            object_user_id = str(item.get("object_user_id") or "").strip()
             if not subject or not relation or not object_:
                 continue
             memories.append(
                 {
                     "type": "relation",
                     "subject": subject[:80],
+                    "subject_user_id": subject_user_id[:80],
                     "relation": relation[:80],
                     "object": object_[:80],
+                    "object_user_id": object_user_id[:80],
+                    "category": str(item.get("category") or "relation").strip()[:40],
                     "note": note[:240],
                     "confidence": max(0.0, min(1.0, confidence)),
+                    "importance": max(0.0, min(1.0, importance)),
                 }
             )
         return memories

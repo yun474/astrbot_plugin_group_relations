@@ -21,16 +21,28 @@ class RelationRecord:
     subject: str
     relation: str
     object: str
+    subject_user_id: str = ""
+    object_user_id: str = ""
+    category: str = "relation"
     note: str = ""
     source: str = "manual"
     confidence: float = 1.0
+    importance: float = 0.6
     created_at: int = field(default_factory=lambda: int(time.time()))
     updated_at: int = field(default_factory=lambda: int(time.time()))
     embedding_provider_id: str = ""
     embedding_dim: int = 0
 
     def text(self) -> str:
-        parts = [self.subject, self.relation, self.object, self.note]
+        parts = [
+            self.subject,
+            self.subject_user_id,
+            self.relation,
+            self.object,
+            self.object_user_id,
+            self.category,
+            self.note,
+        ]
         return " ".join(part for part in parts if part).strip()
 
 
@@ -44,9 +56,26 @@ class GroupMemorySpace:
     owner_display_name: str = ""
     owner_evidence: str = ""
     owner_updated_at: int = 0
+    member_directory_updated_at: int = 0
+    member_directory_source: str = ""
+    member_count: int = 0
     created_at: int = field(default_factory=lambda: int(time.time()))
     updated_at: int = field(default_factory=lambda: int(time.time()))
     message_count: int = 0
+
+
+@dataclass
+class GroupMember:
+    id: str
+    group_id: str
+    user_id: str
+    display_name: str = ""
+    role: str = "member"
+    source: str = "event"
+    active: bool = True
+    first_seen_at: int = field(default_factory=lambda: int(time.time()))
+    last_seen_at: int = field(default_factory=lambda: int(time.time()))
+    verified_at: int = field(default_factory=lambda: int(time.time()))
 
 
 @dataclass
@@ -83,8 +112,22 @@ def profile_id(group_id: str, user_id: str) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
 
 
-def relation_id(group_id: str, subject: str, relation: str, object_: str) -> str:
-    raw = f"{group_id}|{normalize_text(subject)}|{normalize_text(relation)}|{normalize_text(object_)}"
+def member_id(group_id: str, user_id: str) -> str:
+    raw = f"{group_id}|{normalize_text(user_id)}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def relation_id(
+    group_id: str,
+    subject: str,
+    relation: str,
+    object_: str,
+    subject_user_id: str = "",
+    object_user_id: str = "",
+) -> str:
+    subject_key = normalize_text(subject_user_id) or normalize_text(subject)
+    object_key = normalize_text(object_user_id) or normalize_text(object_)
+    raw = f"{group_id}|{subject_key}|{normalize_text(relation)}|{object_key}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
 
 
@@ -135,6 +178,7 @@ class RelationStore:
         self.vectors: dict[str, list[float]] = {}
         self.groups: dict[str, GroupMemorySpace] = {}
         self.profiles: dict[str, UserProfile] = {}
+        self.members: dict[str, GroupMember] = {}
 
     def load(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -143,6 +187,7 @@ class RelationStore:
             self.vectors = {}
             self.groups = {}
             self.profiles = {}
+            self.members = {}
             return
         try:
             payload = json.loads(self.data_file.read_text(encoding="utf-8"))
@@ -151,6 +196,7 @@ class RelationStore:
             self.vectors = {}
             self.groups = {}
             self.profiles = {}
+            self.members = {}
             return
         records = payload.get("relations", [])
         self.records = {}
@@ -168,6 +214,11 @@ class RelationStore:
             profile = self._coerce_profile(item)
             if profile:
                 self.profiles[profile.id] = profile
+        self.members = {}
+        for item in payload.get("members", []):
+            member = self._coerce_member(item)
+            if member:
+                self.members[member.id] = member
         self.vectors = {
             record_id: vector
             for record_id, vector in payload.get("vectors", {}).items()
@@ -190,7 +241,27 @@ class RelationStore:
             payload["updated_at"] = int(payload.get("updated_at") or payload["created_at"])
             payload["message_count"] = int(payload.get("message_count") or 0)
             payload["owner_updated_at"] = int(payload.get("owner_updated_at") or 0)
+            payload["member_directory_updated_at"] = int(payload.get("member_directory_updated_at") or 0)
+            payload["member_count"] = int(payload.get("member_count") or 0)
             return GroupMemorySpace(**payload)
+        except (TypeError, ValueError):
+            return None
+
+    def _coerce_member(self, item: Any) -> GroupMember | None:
+        if not isinstance(item, dict):
+            return None
+        if not item.get("group_id") or not item.get("user_id"):
+            return None
+        allowed = {field_.name for field_ in fields(GroupMember)}
+        payload = {key: value for key, value in item.items() if key in allowed}
+        try:
+            payload["id"] = payload.get("id") or member_id(payload["group_id"], payload["user_id"])
+            payload["role"] = normalize_text(payload.get("role") or "member") or "member"
+            payload["active"] = bool(payload.get("active", True))
+            payload["first_seen_at"] = int(payload.get("first_seen_at") or time.time())
+            payload["last_seen_at"] = int(payload.get("last_seen_at") or payload["first_seen_at"])
+            payload["verified_at"] = int(payload.get("verified_at") or payload["last_seen_at"])
+            return GroupMember(**payload)
         except (TypeError, ValueError):
             return None
 
@@ -208,11 +279,15 @@ class RelationStore:
                 for alias in payload.get("aliases", [])
                 if str(alias).strip()
             ][:12]
-            payload["facts"] = [
-                fact
-                for fact in payload.get("facts", [])
-                if isinstance(fact, dict) and str(fact.get("fact") or "").strip()
-            ][:50]
+            facts = []
+            for fact in payload.get("facts", []):
+                if not isinstance(fact, dict) or not str(fact.get("fact") or "").strip():
+                    continue
+                fact = dict(fact)
+                fact["category"] = str(fact.get("category") or "impression").strip()
+                fact["importance"] = clamp_confidence(fact.get("importance", 0.6), 0.6)
+                facts.append(fact)
+            payload["facts"] = facts[:50]
             payload["message_count"] = int(payload.get("message_count") or 0)
             payload["created_at"] = int(payload.get("created_at") or time.time())
             payload["updated_at"] = int(payload.get("updated_at") or payload["created_at"])
@@ -231,6 +306,7 @@ class RelationStore:
         payload = {key: value for key, value in item.items() if key in allowed}
         try:
             payload["confidence"] = clamp_confidence(payload.get("confidence", 1.0))
+            payload["importance"] = clamp_confidence(payload.get("importance", 0.6), 0.6)
             payload["created_at"] = int(payload.get("created_at") or time.time())
             payload["updated_at"] = int(payload.get("updated_at") or payload["created_at"])
             payload["embedding_dim"] = int(payload.get("embedding_dim") or 0)
@@ -242,6 +318,7 @@ class RelationStore:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         payload = {
             "groups": [asdict(group) for group in self.groups.values()],
+            "members": [asdict(member) for member in self.members.values()],
             "profiles": [asdict(profile) for profile in self.profiles.values()],
             "relations": [asdict(record) for record in self.records.values()],
             "vectors": self.vectors,
@@ -257,6 +334,7 @@ class RelationStore:
         now = int(time.time())
         group_ids = {record.group_id for record in self.records.values()}
         group_ids.update(profile.group_id for profile in self.profiles.values())
+        group_ids.update(member.group_id for member in self.members.values())
         for group_id in group_ids:
             if group_id and group_id not in self.groups:
                 self.groups[group_id] = GroupMemorySpace(
@@ -267,6 +345,123 @@ class RelationStore:
                     created_at=now,
                     updated_at=now,
                 )
+
+    def get_member(self, group_id: str, user_id: str) -> GroupMember | None:
+        return self.members.get(member_id(group_id, user_id))
+
+    def has_member(self, group_id: str, user_id: str) -> bool:
+        member = self.get_member(group_id, user_id)
+        return bool(member and member.active)
+
+    def member_directory_ready(self, group_id: str) -> bool:
+        group = self.groups.get(group_id)
+        return bool(group and group.member_directory_updated_at and group.member_count > 0)
+
+    def upsert_group_member(
+        self,
+        group_id: str,
+        user_id: str,
+        display_name: str = "",
+        role: str = "member",
+        source: str = "event",
+        active: bool = True,
+        save: bool = True,
+    ) -> GroupMember:
+        now = int(time.time())
+        mid = member_id(group_id, user_id)
+        role = normalize_text(role) or "member"
+        member = self.members.get(mid)
+        if not member:
+            member = GroupMember(
+                id=mid,
+                group_id=group_id,
+                user_id=str(user_id).strip(),
+                display_name=display_name.strip(),
+                role=role,
+                source=source.strip() or "event",
+                active=active,
+                first_seen_at=now,
+                last_seen_at=now,
+                verified_at=now,
+            )
+            self.members[mid] = member
+        else:
+            if display_name.strip():
+                member.display_name = display_name.strip()
+            if role_rank(role) >= role_rank(member.role):
+                member.role = role
+            member.source = source.strip() or member.source
+            member.active = active
+            member.last_seen_at = now
+            member.verified_at = now
+        if save:
+            self.save()
+        return member
+
+    def replace_group_members(
+        self,
+        group_id: str,
+        members: list[dict[str, Any]],
+        source: str = "platform",
+    ) -> list[GroupMember]:
+        now = int(time.time())
+        seen: set[str] = set()
+        updated: list[GroupMember] = []
+        for item in members:
+            user_id = str(item.get("user_id") or item.get("id") or "").strip()
+            if not user_id:
+                continue
+            seen.add(user_id)
+            updated.append(
+                self.upsert_group_member(
+                    group_id=group_id,
+                    user_id=user_id,
+                    display_name=str(item.get("display_name") or item.get("nickname") or item.get("card") or "").strip(),
+                    role=str(item.get("role") or "member"),
+                    source=source,
+                    active=True,
+                    save=False,
+                )
+            )
+        for member in self.members.values():
+            if member.group_id == group_id and member.user_id not in seen:
+                member.active = False
+        group = self.groups.get(group_id)
+        if group:
+            group.member_directory_updated_at = now
+            group.member_directory_source = source
+            group.member_count = len(seen)
+            group.updated_at = now
+        self.save()
+        return updated
+
+    def refresh_member_directory_metadata(self, group_id: str, source: str = "event_fallback") -> None:
+        group = self.groups.get(group_id)
+        if not group:
+            return
+        now = int(time.time())
+        group.member_directory_updated_at = now
+        group.member_directory_source = source
+        group.member_count = len(
+            [
+                member
+                for member in self.members.values()
+                if member.group_id == group_id and member.active
+            ]
+        )
+        group.updated_at = now
+        self.save()
+
+    def export_members(self, group_id: str) -> list[dict[str, Any]]:
+        return [
+            asdict(member)
+            for member in sorted(
+                self.members.values(),
+                key=lambda item: (role_rank(item.role), item.last_seen_at),
+                reverse=True,
+            )
+            if member.group_id == group_id and member.active
+        ]
 
     def touch_group(
         self,
@@ -394,6 +589,8 @@ class RelationStore:
         note: str = "",
         source: str = "manual",
         confidence: float = 0.8,
+        category: str = "impression",
+        importance: float = 0.6,
     ) -> UserProfile:
         profile = self.touch_profile(group_id, user_id, display_name)
         fact = re.sub(r"\s+", " ", fact).strip()
@@ -416,15 +613,22 @@ class RelationStore:
                 clamp_confidence(existing.get("confidence", 0.0)),
                 clamp_confidence(confidence, 0.8),
             )
+            existing["category"] = category.strip() or existing.get("category", "impression")
+            existing["importance"] = max(
+                clamp_confidence(existing.get("importance", 0.0), 0.6),
+                clamp_confidence(importance, 0.6),
+            )
             existing["updated_at"] = now
         else:
             profile.facts.insert(
                 0,
                 {
                     "fact": fact[:160],
+                    "category": category.strip() or "impression",
                     "note": note.strip()[:240],
                     "source": source,
                     "confidence": clamp_confidence(confidence, 0.8),
+                    "importance": clamp_confidence(importance, 0.6),
                     "created_at": now,
                     "updated_at": now,
                 },
@@ -473,6 +677,8 @@ class RelationStore:
         fact: str | None = None,
         note: str | None = None,
         confidence: float | None = None,
+        category: str | None = None,
+        importance: float | None = None,
     ) -> UserProfile | None:
         profile = self.profiles.get(profile_id_)
         if not profile or profile.group_id != group_id:
@@ -489,6 +695,10 @@ class RelationStore:
             item["note"] = note.strip()[:240]
         if confidence is not None:
             item["confidence"] = clamp_confidence(confidence, 0.8)
+        if category is not None and category.strip():
+            item["category"] = category.strip()
+        if importance is not None:
+            item["importance"] = clamp_confidence(importance, 0.6)
         item["updated_at"] = int(time.time())
         profile.updated_at = int(time.time())
         self.save()
@@ -549,19 +759,30 @@ class RelationStore:
         subject: str,
         relation: str,
         object_: str,
+        subject_user_id: str = "",
+        object_user_id: str = "",
+        category: str = "relation",
         note: str = "",
         source: str = "manual",
         confidence: float = 1.0,
+        importance: float = 0.6,
         vector: list[float] | None = None,
         embedding_provider_id: str = "",
     ) -> RelationRecord:
-        rid = relation_id(group_id, subject, relation, object_)
+        subject_user_id = str(subject_user_id or "").strip()
+        object_user_id = str(object_user_id or "").strip()
+        category = str(category or "relation").strip()
+        rid = relation_id(group_id, subject, relation, object_, subject_user_id, object_user_id)
         now = int(time.time())
         existing = self.records.get(rid)
         if existing:
+            existing.subject_user_id = subject_user_id or existing.subject_user_id
+            existing.object_user_id = object_user_id or existing.object_user_id
+            existing.category = category or existing.category
             existing.note = note or existing.note
             existing.source = source or existing.source
             existing.confidence = max(existing.confidence, clamp_confidence(confidence))
+            existing.importance = max(existing.importance, clamp_confidence(importance, 0.6))
             existing.updated_at = now
             if embedding_provider_id:
                 existing.embedding_provider_id = embedding_provider_id
@@ -575,9 +796,13 @@ class RelationStore:
                 subject=subject.strip(),
                 relation=relation.strip(),
                 object=object_.strip(),
+                subject_user_id=subject_user_id,
+                object_user_id=object_user_id,
+                category=category,
                 note=note.strip(),
                 source=source,
                 confidence=clamp_confidence(confidence),
+                importance=clamp_confidence(importance, 0.6),
                 embedding_provider_id=embedding_provider_id,
                 embedding_dim=len(vector or []),
             )
@@ -604,8 +829,12 @@ class RelationStore:
         subject: str | None = None,
         relation: str | None = None,
         object_: str | None = None,
+        subject_user_id: str | None = None,
+        object_user_id: str | None = None,
+        category: str | None = None,
         note: str | None = None,
         confidence: float | None = None,
+        importance: float | None = None,
         vector: list[float] | None = None,
         embedding_provider_id: str = "",
     ) -> RelationRecord | None:
@@ -618,10 +847,18 @@ class RelationStore:
             record.relation = relation.strip()
         if object_:
             record.object = object_.strip()
+        if subject_user_id is not None:
+            record.subject_user_id = subject_user_id.strip()
+        if object_user_id is not None:
+            record.object_user_id = object_user_id.strip()
+        if category is not None and category.strip():
+            record.category = category.strip()
         if note is not None:
             record.note = note.strip()
         if confidence is not None:
             record.confidence = max(0.0, min(1.0, confidence))
+        if importance is not None:
+            record.importance = clamp_confidence(importance, 0.6)
         if embedding_provider_id:
             record.embedding_provider_id = embedding_provider_id
         if vector is not None:
@@ -630,7 +867,14 @@ class RelationStore:
         else:
             self.vectors[relation_id_] = embed_text(record.text())
         record.updated_at = int(time.time())
-        new_id = relation_id(record.group_id, record.subject, record.relation, record.object)
+        new_id = relation_id(
+            record.group_id,
+            record.subject,
+            record.relation,
+            record.object,
+            record.subject_user_id,
+            record.object_user_id,
+        )
         if new_id != relation_id_:
             self.records.pop(relation_id_, None)
             self.vectors.pop(relation_id_, None)
@@ -640,6 +884,10 @@ class RelationStore:
                 existing.note = record.note or existing.note
                 existing.source = record.source or existing.source
                 existing.confidence = max(existing.confidence, record.confidence)
+                existing.importance = max(existing.importance, record.importance)
+                existing.subject_user_id = record.subject_user_id or existing.subject_user_id
+                existing.object_user_id = record.object_user_id or existing.object_user_id
+                existing.category = record.category or existing.category
                 existing.updated_at = record.updated_at
                 existing.embedding_provider_id = record.embedding_provider_id
                 existing.embedding_dim = record.embedding_dim
@@ -655,12 +903,41 @@ class RelationStore:
             record
             for record in self.records.values()
             if record.group_id == group_id
-            and (needle in normalize_text(record.subject) or needle in normalize_text(record.object))
+            and (
+                needle in normalize_text(record.subject)
+                or needle in normalize_text(record.object)
+                or needle in normalize_text(record.subject_user_id)
+                or needle in normalize_text(record.object_user_id)
+            )
         ]
         return sorted(matches, key=lambda item: item.updated_at, reverse=True)[:limit]
 
+    def by_user_id(self, group_id: str, user_id: str, limit: int = 8) -> list[RelationRecord]:
+        needle = normalize_text(user_id)
+        if not needle:
+            return self.recent(group_id, limit=limit)
+        matches = [
+            record
+            for record in self.records.values()
+            if record.group_id == group_id
+            and (
+                normalize_text(record.subject_user_id) == needle
+                or normalize_text(record.object_user_id) == needle
+                or normalize_text(record.subject) == needle
+                or normalize_text(record.object) == needle
+            )
+        ]
+        return sorted(
+            matches,
+            key=lambda item: (item.importance, item.updated_at),
+            reverse=True,
+        )[:limit]
+
     def get_profile(self, group_id: str, user_id: str) -> UserProfile | None:
         return self.profiles.get(profile_id(group_id, user_id))
+
+    def find_profile_by_user_id(self, group_id: str, user_id: str) -> UserProfile | None:
+        return self.get_profile(group_id, user_id)
 
     def find_profiles(
         self,
@@ -751,7 +1028,14 @@ class RelationStore:
         for group in self.find_user_groups(user_id):
             changed = False
             for source in source_records:
-                target_id = relation_id(group.id, source.subject, source.relation, source.object)
+                target_id = relation_id(
+                    group.id,
+                    source.subject,
+                    source.relation,
+                    source.object,
+                    source.subject_user_id,
+                    source.object_user_id,
+                )
                 target = self.records.get(target_id)
                 if target and target.updated_at >= source.updated_at:
                     continue
@@ -763,6 +1047,10 @@ class RelationStore:
                     target.updated_at = now
                     target.embedding_provider_id = source.embedding_provider_id
                     target.embedding_dim = source.embedding_dim
+                    target.subject_user_id = source.subject_user_id
+                    target.object_user_id = source.object_user_id
+                    target.category = source.category
+                    target.importance = source.importance
                 else:
                     target = RelationRecord(
                         id=target_id,
@@ -770,9 +1058,13 @@ class RelationStore:
                         subject=source.subject,
                         relation=source.relation,
                         object=source.object,
+                        subject_user_id=source.subject_user_id,
+                        object_user_id=source.object_user_id,
+                        category=source.category,
                         note=source.note,
                         source=source_label,
                         confidence=source.confidence,
+                        importance=source.importance,
                         created_at=now,
                         updated_at=now,
                         embedding_provider_id=source.embedding_provider_id,
@@ -837,6 +1129,12 @@ class RelationStore:
             if record.group_id != group_id:
                 continue
             record_norm = normalize_text(record.text())
+            if query_norm in {
+                normalize_text(record.subject_user_id),
+                normalize_text(record.object_user_id),
+            }:
+                scored.append((record, 1.0))
+                continue
             if query_norm in record_norm:
                 scored.append((record, 0.25))
                 continue
@@ -846,7 +1144,7 @@ class RelationStore:
             overlap = len(query_tokens & record_tokens) / max(len(query_tokens), 1)
             if overlap >= 0.15:
                 scored.append((record, overlap))
-        scored.sort(key=lambda item: (item[1], item[0].updated_at), reverse=True)
+        scored.sort(key=lambda item: (item[1], item[0].importance, item[0].updated_at), reverse=True)
         return scored[:limit]
 
     def search_by_vector(
@@ -867,7 +1165,7 @@ class RelationStore:
             score = max(lexical, semantic)
             if score >= threshold:
                 scored.append((record, score))
-        scored.sort(key=lambda item: (item[1], item[0].updated_at), reverse=True)
+        scored.sort(key=lambda item: (item[1], item[0].importance, item[0].updated_at), reverse=True)
         return scored[:limit]
 
     def export_group(self, group_id: str) -> list[dict[str, Any]]:
@@ -890,8 +1188,11 @@ def normalize_vector(vector: list[float]) -> list[float]:
 
 def format_record(record: RelationRecord, with_id: bool = True) -> str:
     prefix = f"[{record.id}] " if with_id else ""
+    subject = f"{record.subject}({record.subject_user_id})" if record.subject_user_id else record.subject
+    object_ = f"{record.object}({record.object_user_id})" if record.object_user_id else record.object
+    category = f"[{record.category}] " if record.category and record.category != "relation" else ""
     note = f"（{record.note}）" if record.note else ""
-    return f"{prefix}{record.subject} --{record.relation}--> {record.object}{note}"
+    return f"{prefix}{category}{subject} --{record.relation}--> {object_}{note}"
 
 
 def format_profile(profile: UserProfile, max_facts: int = 5) -> str:
