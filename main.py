@@ -11,16 +11,14 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star
 from astrbot.core.agent.message import TextPart
-from astrbot.core.provider.provider import EmbeddingProvider, Provider
+from astrbot.core.provider.provider import Provider
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 from .relation_store import (
     RelationRecord,
     RelationStore,
-    embed_text,
     format_profile,
     format_record,
-    normalize_vector,
 )
 
 
@@ -77,22 +75,10 @@ class GroupRelationsPlugin(Star):
         data_dir = Path(get_astrbot_data_path()) / "plugin_data" / PLUGIN_NAME
         self.store = RelationStore(data_dir)
         self.store.load()
-        self._reembed_started = False
-        self._warned_embedding_provider_ids: set[str] = set()
-        self._warned_no_embedding_provider = False
-        self._warned_local_embedding_fallback = False
         self._warned_summary_provider_ids: set[str] = set()
         self._warned_no_summary_provider = False
-        self._provider_options_task: asyncio.Task | None = None
         self._summary_buffers: dict[str, list[dict[str, str]]] = {}
-        self._refresh_embedding_provider_options()
         self._register_web_apis()
-        try:
-            self._provider_options_task = asyncio.create_task(
-                self._refresh_embedding_provider_options_later()
-            )
-        except RuntimeError:
-            self._provider_options_task = None
 
     def _cfg(self, primary: str, fallback: str | None = None, default=None):
         value = self.config.get(primary, None)
@@ -143,7 +129,6 @@ class GroupRelationsPlugin(Star):
                     "/关系 刷新目录",
                     "/关系 调试 <查询词>",
                     "/关系 最近",
-                    "/关系 向量",
                 ]
             )
         )
@@ -155,7 +140,6 @@ class GroupRelationsPlugin(Star):
             yield event.plain_result(self._debug_denied_message())
             return
         self._touch_event_scope(event)
-        provider = self._get_embedding_provider(silent=True)
         scope_id = self._scope_id(event)
         yield event.plain_result(
             "\n".join(
@@ -169,8 +153,7 @@ class GroupRelationsPlugin(Star):
                     f"工具写入：{bool(self.config.get('enable_tool_write', False))}",
                     f"工具修改/删除：{bool(self.config.get('enable_tool_update', False))}",
                     f"记忆隔离：{self.config.get('memory_scope', 'group')}",
-                    f"Embedding Provider：{provider.meta().id if provider else '不可用'}",
-                    f"向量本地回退：{bool(self.config.get('enable_local_embedding_fallback', False))}",
+                    "召回方式：user_id 优先 + 文本匹配",
                     f"总结 Provider：{self._cfg('自动总结_模型Provider', 'summary_provider_id', '') or '当前会话模型'}",
                     f"总结参考人格：{self._summary_persona_label()}",
                     f"已记录群空间：{len(self.store.groups)}",
@@ -321,41 +304,6 @@ class GroupRelationsPlugin(Star):
         )
         yield event.plain_result("\n".join(format_record(record) for record in records) or "当前会话还没有关系记录。")
 
-    @relations.command("向量")
-    async def vector_status(self, event: AstrMessageEvent):
-        """查看向量化配置。"""
-        if not self._can_use_debug_commands(event):
-            yield event.plain_result(self._debug_denied_message())
-            return
-        self._refresh_embedding_provider_options()
-        await self._maybe_reembed_records()
-        provider_id = str(self.config.get("embedding_provider_id", "")).strip()
-        all_providers = self._list_embedding_providers()
-        if not provider_id:
-            provider = self._get_embedding_provider(silent=True)
-            if provider:
-                yield event.plain_result(
-                    f"当前未指定 Provider，自动使用：{provider.meta().id}，维度：{provider.get_dim()}"
-                )
-            else:
-                fallback = "开启" if bool(self.config.get("enable_local_embedding_fallback", False)) else "关闭"
-                yield event.plain_result(
-                    "当前没有可用的 AstrBot Embedding Provider；"
-                    f"本地哈希回退：{fallback}。\n"
-                    "请在 AstrBot 服务提供商中配置 Embedding Provider，或临时开启本地回退。"
-                )
-            return
-        provider = self._get_embedding_provider()
-        if not provider:
-            available = ", ".join(provider.meta().id for provider in all_providers) or "无"
-            yield event.plain_result(
-                f"未找到可用的 Embedding Provider：{provider_id}\n当前可选：{available}"
-            )
-            return
-        yield event.plain_result(
-            f"当前使用 AstrBot Embedding Provider：{provider_id}，维度：{provider.get_dim()}"
-        )
-
     def _register_web_apis(self) -> None:
         register = getattr(self.context, "register_web_api", None)
         if not callable(register):
@@ -487,15 +435,10 @@ class GroupRelationsPlugin(Star):
         object_user_id = str(data.get("object_user_id") or "").strip()
         category = str(data.get("category") or "relation").strip()
         note = str(data.get("note") or "").strip()
-        category = str(data.get("category") or "impression").strip()
         try:
             confidence = float(data.get("confidence", 0.8))
         except (TypeError, ValueError):
             confidence = 0.8
-        try:
-            importance = float(data.get("importance", 0.6))
-        except (TypeError, ValueError):
-            importance = 0.6
         try:
             importance = float(data.get("importance", 0.6))
         except (TypeError, ValueError):
@@ -514,7 +457,6 @@ class GroupRelationsPlugin(Star):
             return self._web_error(f"subject_user_id `{subject_user_id}` is not in this group member directory")
         if object_user_id and not self._web_can_use_group_user(group_id, object_user_id):
             return self._web_error(f"object_user_id `{object_user_id}` is not in this group member directory")
-        vector, provider_id = await self._embed(text)
         if relation_id_:
             updated = self.store.update(
                 relation_id_,
@@ -528,8 +470,6 @@ class GroupRelationsPlugin(Star):
                 note=note,
                 confidence=confidence,
                 importance=importance,
-                vector=vector,
-                embedding_provider_id=provider_id,
             )
             if not updated:
                 return self._web_error("relation not found", 404)
@@ -548,8 +488,6 @@ class GroupRelationsPlugin(Star):
                 source="webui",
                 confidence=confidence,
                 importance=importance,
-                vector=vector,
-                embedding_provider_id=provider_id,
             )
         return self._web_ok(memory=self._web_memory_payload(group_id))
 
@@ -623,10 +561,15 @@ class GroupRelationsPlugin(Star):
         profile_id_ = str(data.get("profile_id") or "").strip()
         fact = str(data.get("fact") or "").strip()
         note = str(data.get("note") or "").strip()
+        category = str(data.get("category") or "impression").strip()
         try:
             confidence = float(data.get("confidence", 0.8))
         except (TypeError, ValueError):
             confidence = 0.8
+        try:
+            importance = float(data.get("importance", 0.6))
+        except (TypeError, ValueError):
+            importance = 0.6
         if not group_id or not profile_id_:
             return self._web_error("missing group_id or profile_id")
         profile = self.store.profiles.get(profile_id_)
@@ -763,80 +706,52 @@ class GroupRelationsPlugin(Star):
         self._sync_private_profile_if_needed(event)
         self._summary_buffers[scope_id] = []
 
-    @filter.llm_tool(name="group_relation_search")
-    async def group_relation_search(self, event: AstrMessageEvent, query: str = "", user_id: str = ""):
-        """优先在当前群空间查询人物关系记忆；配置允许时会补充同一用户其他群空间的结果。
+    @filter.llm_tool(name="group_user_context_lookup")
+    async def group_user_context_lookup(self, event: AstrMessageEvent, user_id: str = "", query: str = ""):
+        """一次性查询某个群成员在当前群环境里的身份、画像、关系和跨群补充。
 
         使用场景：
-        - 用户询问“谁和谁是什么关系”“某人是谁”“某人和我/机器人/群友有什么关联”。
-        - 本轮注入的关系不足以回答，但问题明显依赖群内人际背景。
-        - 需要核对某个人名、昵称、组织、事件或关系类型。
+        - 回答前需要知道当前正在和谁聊天、对方在本群是什么身份、有哪些印象和人物关系。
+        - 用户问“这个人是谁”“我和某人什么关系”“群主/管理员是谁”等环境问题。
+        - 本轮注入的环境上下文不足，需要按 user_id 查完整人物上下文。
 
         注意：
-        - 当前群结果优先；跨群结果会标注来源群，不要把其他群的事实强行当作当前群事实。
-        - 没查到就说明记忆不足，不要自行补全。
+        - 知道用户 ID 时必须传 user_id；query 只用于不知道 ID 时按昵称/关键词查找。
+        - 当前群结果优先；跨群结果会标注来源群，只能作为补充背景。
 
         Args:
-            query(string): 人名、昵称、关系、事件或自然语言问题；不知道 user_id 时使用。
-            user_id(string): 优先按群成员用户 ID 精确召回此人的关系；知道 ID 时优先填写。
+            user_id(string): 要查询的群成员用户 ID；留空时默认当前发言人。
+            query(string): 不知道用户 ID 时用于搜索昵称、群名片或关键词。
         """
         if not bool(self.config.get("enable_tool_read", True)):
-            yield event.plain_result("群关系记忆查询工具当前未启用。")
+            yield event.plain_result("群人物上下文查询工具当前未启用。")
             return
         self._touch_event_scope(event)
-        matches = await self._search_relations(event, query or user_id or _sender_id(event), user_id=user_id)
-        if not matches:
-            yield event.plain_result(f"没有找到和「{query}」相关的群关系记忆。")
-            return
-        lines = [self._format_tool_record(event, record) for record, _score in matches]
-        yield event.plain_result("\n".join(lines))
-
-    @filter.llm_tool(name="group_user_profile_search")
-    async def group_user_profile_search(self, event: AstrMessageEvent, query: str = "", user_id: str = ""):
-        """优先在当前群空间查询用户画像；配置允许时会补充同一用户其他群空间的结果。
-
-        使用场景：
-        - 用户询问某个群友的身份、偏好、别名、常见互动对象或稳定特征。
-        - 回答前需要确认当前发言人或相关人物的画像。
-        - 本轮注入的画像不足，且问题明显依赖群友背景。
-
-        注意：
-        - 当前群结果优先；跨群结果会标注来源群，不要把其他群的事实强行当作当前群事实。
-        - 不要把画像事实扩展成未记录的隐私、评价或推测。
-
-        Args:
-            query(string): 昵称、群名片或画像关键词；留空查询当前发言人。
-            user_id(string): 优先按用户 ID 精确查询；知道 ID 时优先填写。
-        """
-        if not bool(self.config.get("enable_tool_read", True)):
-            yield event.plain_result("群用户画像查询工具当前未启用。")
-            return
-        self._touch_event_scope(event)
-        allow_cross_group = self._cfg_bool("记忆隔离_允许跨群召回", None, True)
         lookup_user_id = str(user_id or "").strip()
-        if lookup_user_id:
-            profile = self.store.find_profile_by_user_id(self._scope_id(event), lookup_user_id)
-            profiles = [profile] if profile else []
-        else:
-            profiles = self.store.find_profiles(
+        if not lookup_user_id and query.strip():
+            matched_profiles = self.store.find_profiles(
                 self._scope_id(event),
-                query=query or _sender_id(event),
-                limit=self._cfg_int("记忆管理_画像查询返回人数", "max_profile_results", 5),
+                query=query,
+                limit=1,
             )
-        if allow_cross_group:
-            profiles = self._cross_group_profiles(
-                lookup_user_id or _sender_id(event),
-                lookup_user_id or query or _sender_id(event),
-                profiles,
-                self._scope_id(event),
-            )
-        if not profiles:
-            yield event.plain_result(f"没有找到和「{query}」相关的群用户画像。")
-            return
-        yield event.plain_result("\n".join(self._format_tool_profile(event, profile) for profile in profiles))
+            if matched_profiles:
+                lookup_user_id = matched_profiles[0].user_id
+            else:
+                matches = await self._search_relations(event, query)
+                lines = [f"没有找到「{query}」对应的群成员画像。"]
+                if matches:
+                    lines.extend(["按文本找到的关系："])
+                    lines.extend(self._format_tool_record(event, record) for record, _score in matches)
+                else:
+                    lines.append("也没有找到相关关系；请提供准确 user_id 后再查。")
+                yield event.plain_result("\n".join(lines))
+                return
+        lookup_user_id = lookup_user_id or _sender_id(event)
+        text = self._format_user_context_lookup(event, lookup_user_id, query)
+        yield event.plain_result(text)
 
-    @filter.llm_tool(name="group_relation_remember")
-    async def group_relation_remember(
+    @filter.llm_tool(name="group_relation_save")
+    async def group_relation_save(
         self,
         event: AstrMessageEvent,
         subject: str,
@@ -849,7 +764,7 @@ class GroupRelationsPlugin(Star):
         confidence: float = 0.8,
         importance: float = 0.6,
     ):
-        """写入当前群空间内一条明确、稳定、可复用的人物关系记忆。
+        """写入当前群空间内一条明确、稳定、可复用的人物关系上下文。
 
         只有当用户明确表达或明确纠正关系时才调用。适合记录：
         - A 是 B 的朋友/同学/同事/亲属/管理员/常一起玩的对象。
@@ -900,10 +815,10 @@ class GroupRelationsPlugin(Star):
             importance=importance,
         )
         self._sync_private_profile_if_needed(event)
-        yield event.plain_result(f"已写入群关系记忆：{format_record(record)}")
+        yield event.plain_result(f"已写入群关系上下文：{format_record(record)}")
 
-    @filter.llm_tool(name="group_user_profile_remember")
-    async def group_user_profile_remember(
+    @filter.llm_tool(name="group_user_profile_save")
+    async def group_user_profile_save(
         self,
         event: AstrMessageEvent,
         user_id: str,
@@ -914,7 +829,7 @@ class GroupRelationsPlugin(Star):
         category: str = "impression",
         importance: float = 0.6,
     ):
-        """写入当前群空间内某个用户的稳定画像事实。
+        """写入当前群空间内某个用户的稳定画像事实，用于帮助理解群环境和人物关系。
 
         只有当用户本人自述、管理员确认、或群聊中明确确认时才调用。适合记录：
         - 用户ID对应的昵称/群名片、常用别名。
@@ -957,7 +872,7 @@ class GroupRelationsPlugin(Star):
         )
         self._trim_profile_facts(profile)
         self._sync_private_profile_if_needed(event)
-        yield event.plain_result(f"已写入群用户画像：{format_profile(profile)}")
+        yield event.plain_result(f"已写入群用户画像上下文：{format_profile(profile)}")
 
     @filter.llm_tool(name="group_relation_update")
     async def group_relation_update(
@@ -977,7 +892,7 @@ class GroupRelationsPlugin(Star):
         """根据用户明确纠正，修改一条当前群空间内的人物关系记忆。
 
         只有当用户明确指出旧记忆错误或给出更准确说法时才调用。
-        修改前应尽量先通过 group_relation_search 找到 relation_id。
+        修改前应尽量先通过 group_user_context_lookup 找到 relation_id。
 
         Args:
             relation_id(string): 要修改的关系 ID。
@@ -999,9 +914,6 @@ class GroupRelationsPlugin(Star):
         if not old or old.group_id != self._scope_id(event):
             yield event.plain_result("没有找到这条关系，或它不属于当前群。")
             return
-        new_subject = subject or old.subject
-        new_relation = relation or old.relation
-        new_object = object_ or old.object
         new_subject_user_id = subject_user_id or old.subject_user_id
         new_object_user_id = object_user_id or old.object_user_id
         ok, reason = await self._validate_relation_users_for_write(
@@ -1012,9 +924,6 @@ class GroupRelationsPlugin(Star):
         if not ok:
             yield event.plain_result(reason)
             return
-        new_note = note if note else old.note
-        text = " ".join(part for part in [new_subject, new_subject_user_id, new_relation, new_object, new_object_user_id, new_note] if part)
-        vector, provider_id = await self._embed(text)
         updated = self.store.update(
             relation_id,
             group_id=self._scope_id(event),
@@ -1027,8 +936,6 @@ class GroupRelationsPlugin(Star):
             note=note if note else None,
             confidence=None if confidence < 0 else confidence,
             importance=None if importance < 0 else importance,
-            vector=vector,
-            embedding_provider_id=provider_id,
         )
         yield event.plain_result(f"已更新：{format_record(updated)}" if updated else "更新失败。")
 
@@ -1037,7 +944,7 @@ class GroupRelationsPlugin(Star):
         """根据用户明确纠正，删除一条当前群空间内的人物关系记忆。
 
         只有当用户明确表示某条关系是错的、过期的或不应记录时才调用。
-        删除前应尽量先通过 group_relation_search 找到 relation_id。
+        删除前应尽量先通过 group_user_context_lookup 找到 relation_id。
 
         Args:
             relation_id(string): 要删除的关系 ID。
@@ -1093,9 +1000,6 @@ class GroupRelationsPlugin(Star):
         confidence: float = 1.0,
         importance: float = 0.6,
     ) -> RelationRecord:
-        await self._maybe_reembed_records()
-        text = " ".join(part for part in [subject, subject_user_id, relation, object_, object_user_id, category, note] if part)
-        vector, provider_id = await self._embed(text)
         return self.store.upsert(
             group_id=group_id,
             subject=subject,
@@ -1108,8 +1012,6 @@ class GroupRelationsPlugin(Star):
             source=source,
             confidence=confidence,
             importance=importance,
-            vector=vector,
-            embedding_provider_id=provider_id,
         )
 
     def _debug_denied_message(self) -> str:
@@ -1509,7 +1411,6 @@ class GroupRelationsPlugin(Star):
         user_id: str = "",
         limit: int | None = None,
     ) -> list[tuple[RelationRecord, float]]:
-        await self._maybe_reembed_records()
         limit = limit or int(self.config.get("max_query_results", 8))
         lookup_user_id = str(user_id or "").strip()
         if lookup_user_id:
@@ -1521,21 +1422,7 @@ class GroupRelationsPlugin(Star):
                 limit,
                 user_id=lookup_user_id,
             )
-        threshold = float(self.config.get("similarity_threshold", 0.12))
-        if self._cfg_bool("召回_优先使用用户ID和文本", None, True):
-            matches = self.store.search_by_text(self._scope_id(event), query, limit=limit)
-            return self._cross_group_relation_fallback(event, query, self._cap_speaker_relations(event, matches), limit)
-        vector, _provider_id = await self._embed(query)
-        if vector:
-            matches = self.store.search_by_vector(
-                self._scope_id(event),
-                query,
-                vector,
-                limit=limit,
-                threshold=threshold,
-            )
-        else:
-            matches = self.store.search_by_text(self._scope_id(event), query, limit=limit)
+        matches = self.store.search_by_text(self._scope_id(event), query, limit=limit)
         return self._cross_group_relation_fallback(event, query, self._cap_speaker_relations(event, matches), limit)
 
     def _cross_group_relation_fallback(
@@ -1586,6 +1473,83 @@ class GroupRelationsPlugin(Star):
                 if len(merged) >= limit:
                     return merged[:limit]
         return merged
+
+    def _format_user_context_lookup(self, event: AstrMessageEvent, user_id: str, query: str = "") -> str:
+        scope_id = self._scope_id(event)
+        group = self.store.groups.get(scope_id)
+        member = self.store.get_member(scope_id, user_id)
+        profile = self.store.get_profile(scope_id, user_id)
+        relations = self.store.by_user_id(scope_id, user_id, limit=int(self.config.get("max_query_results", 8)))
+        if not profile and query:
+            matches = self.store.find_profiles(scope_id, query=query, limit=1)
+            if matches:
+                profile = matches[0]
+                user_id = profile.user_id
+                member = self.store.get_member(scope_id, user_id)
+                relations = self.store.by_user_id(scope_id, user_id, limit=int(self.config.get("max_query_results", 8)))
+
+        lines = [
+            "<group_user_context>",
+            f"当前群: {group.name if group else self._session_label(event)}",
+            f"群空间ID: {scope_id}",
+            f"查询用户ID: {user_id}",
+        ]
+        if member:
+            lines.extend(
+                [
+                    "群成员目录:",
+                    f"- 昵称/群名片: {member.display_name or user_id}",
+                    f"- 群身份: {member.role}",
+                    f"- 目录来源: {member.source}",
+                ]
+            )
+        else:
+            lines.append("群成员目录: 当前群目录中未找到该用户。")
+        if profile:
+            lines.extend(
+                [
+                    "用户画像:",
+                    f"- 显示名: {profile.display_name or user_id}",
+                    f"- 群身份: {profile.group_role or 'unknown'}",
+                    f"- 身份来源: {profile.role_evidence or '未记录'}",
+                    f"- 别名: {', '.join(profile.aliases) if profile.aliases else '无'}",
+                    f"- 触达次数: {profile.message_count}",
+                ]
+            )
+            if profile.facts:
+                lines.append("- 画像事实:")
+                for item in profile.facts[: self._cfg_int("记忆管理_当前发言人画像条数", "person_profile_max_items", 4)]:
+                    fact = str(item.get("fact") or "").strip()
+                    if fact:
+                        category = str(item.get("category") or "impression")
+                        lines.append(f"  - [{category}] {fact}")
+        else:
+            lines.append("用户画像: 暂无。")
+        if relations:
+            lines.append("当前群关系:")
+            lines.extend(f"- {format_record(record)}" for record in relations)
+        else:
+            lines.append("当前群关系: 暂无。")
+
+        if self._cfg_bool("记忆隔离_允许跨群召回", None, True):
+            cross_lines = []
+            for other_group in self.store.find_user_groups(user_id):
+                if other_group.id == scope_id:
+                    continue
+                other_profile = self.store.get_profile(other_group.id, user_id)
+                other_relations = self.store.by_user_id(other_group.id, user_id, limit=4)
+                if not other_profile and not other_relations:
+                    continue
+                cross_lines.append(f"- 来自群 {other_group.name or other_group.id}:")
+                if other_profile:
+                    cross_lines.append(f"  画像: {format_profile(other_profile, max_facts=3)}")
+                for record in other_relations:
+                    cross_lines.append(f"  关系: {format_record(record)}")
+            if cross_lines:
+                lines.append("跨群补充:")
+                lines.extend(cross_lines)
+        lines.append("</group_user_context>")
+        return "\n".join(lines)
 
     def _group_label_for_memory(self, group_id: str) -> str:
         group = self.store.groups.get(group_id)
@@ -1729,10 +1693,9 @@ class GroupRelationsPlugin(Star):
         lines.extend(
             [
                 "",
-                "如果用户询问人物关系但以上信息不足，可以主动调用 group_relation_search；知道用户ID时必须传 user_id。",
-                "如果用户询问群内某人的画像但以上信息不足，可以主动调用 group_user_profile_search；知道用户ID时必须传 user_id。",
-                "只有当用户明确提供稳定事实或明确纠正时，才在开关允许时写入/修改/删除记忆。",
-                "画像写入使用 group_user_profile_remember；关系写入/修改/删除使用 group_relation_remember / group_relation_update / group_relation_delete。",
+                "如果用户询问群友身份、画像或人物关系但以上信息不足，可以主动调用 group_user_context_lookup；知道用户ID时必须传 user_id。",
+                "只有当用户明确提供稳定环境事实、人物关系或明确纠正时，才在开关允许时写入/修改/删除。",
+                "画像写入使用 group_user_profile_save；关系写入/修改/删除使用 group_relation_save / group_relation_update / group_relation_delete。",
                 "</group_relation_context>",
             ]
         )
@@ -1819,134 +1782,6 @@ class GroupRelationsPlugin(Star):
             )):
                 facts.append(format_record(record, with_id=False))
         return "；".join(facts)
-
-    async def _embed(self, text: str) -> tuple[list[float] | None, str]:
-        max_length = int(self.config.get("max_embedding_text_length", 2000))
-        if max_length > 0 and len(text) > max_length:
-            logger.warning(
-                f"group relation embedding text too long ({len(text)} chars), "
-                f"truncated to {max_length}"
-            )
-            text = text[:max_length]
-        provider = self._get_embedding_provider()
-        if provider:
-            try:
-                return normalize_vector(await provider.get_embedding(text)), provider.meta().id
-            except Exception as exc:
-                logger.warning(
-                    f"group relation AstrBot embedding failed with provider `{provider.meta().id}`: {exc}"
-                )
-        if bool(self.config.get("enable_local_embedding_fallback", False)):
-            if not self._warned_local_embedding_fallback:
-                logger.warning(
-                    "group relation falling back to local hash embedding because AstrBot embedding is unavailable."
-                )
-                self._warned_local_embedding_fallback = True
-            return embed_text(text), "local_hash"
-        if not self._warned_no_embedding_provider:
-            logger.warning(
-                "group relation embedding unavailable: no valid AstrBot Embedding Provider resolved "
-                "and local fallback is disabled. Configure embedding_provider_id or add an Embedding Provider."
-            )
-            self._warned_no_embedding_provider = True
-        return None, ""
-
-    def _get_embedding_provider(self, silent: bool = False) -> EmbeddingProvider | None:
-        provider_id = str(self.config.get("embedding_provider_id", "")).strip()
-        if not provider_id:
-            providers = self._list_embedding_providers()
-            if providers:
-                return providers[0]
-            if not silent and not self._warned_no_embedding_provider:
-                logger.warning(
-                    "group relation found no configured AstrBot Embedding Provider. "
-                    "Vector search/write will wait for a provider, unless local fallback is enabled."
-                )
-                self._warned_no_embedding_provider = True
-            return None
-        provider = self.context.get_provider_by_id(provider_id)
-        if isinstance(provider, EmbeddingProvider):
-            return provider
-        if not silent and provider_id not in self._warned_embedding_provider_ids:
-            logger.warning(f"group relation embedding provider `{provider_id}` not found or invalid")
-            self._warned_embedding_provider_ids.add(provider_id)
-        return None
-
-    def _list_embedding_providers(self) -> list[EmbeddingProvider]:
-        try:
-            return list(self.context.get_all_embedding_providers())
-        except Exception as exc:
-            logger.warning(f"group relation failed to list embedding providers: {exc}")
-            return []
-
-    def _refresh_embedding_provider_options(self) -> None:
-        schema = getattr(self.config, "schema", None)
-        if not isinstance(schema, dict):
-            return
-        item = schema.get("embedding_provider_id")
-        if not isinstance(item, dict):
-            return
-        providers = self._list_embedding_providers()
-        options = [""]
-        labels = ["自动选择第一个可用 Embedding Provider"]
-        for provider in providers:
-            meta = provider.meta()
-            provider_id = meta.id
-            if not provider_id or provider_id in options:
-                continue
-            model = provider.get_model() or provider.provider_config.get("embedding_model", "")
-            dim = provider.get_dim()
-            label_parts = [provider_id]
-            if model:
-                label_parts.append(str(model))
-            if dim:
-                label_parts.append(f"{dim}维")
-            options.append(provider_id)
-            labels.append(" / ".join(label_parts))
-        item["options"] = options
-        item["labels"] = labels
-
-    async def _refresh_embedding_provider_options_later(self) -> None:
-        for _ in range(30):
-            self._refresh_embedding_provider_options()
-            if self._list_embedding_providers():
-                return
-            await asyncio.sleep(2)
-
-    async def _maybe_reembed_records(self) -> None:
-        if self._reembed_started:
-            return
-        self._reembed_started = True
-        if not bool(self.config.get("reembed_on_provider_change", False)):
-            return
-        provider = self._get_embedding_provider()
-        if not provider:
-            return
-        provider_id = provider.meta().id
-        records = [
-            record
-            for record in self.store.records.values()
-            if record.embedding_provider_id != provider_id
-        ]
-        if not records:
-            return
-        try:
-            texts = [record.text() for record in records]
-            vectors = await provider.get_embeddings(texts)
-        except Exception as exc:
-            logger.warning(f"group relation re-embedding failed: {exc}")
-            return
-        if len(vectors) != len(records):
-            logger.warning(
-                "group relation re-embedding skipped: vector count mismatch "
-                f"expected={len(records)} actual={len(vectors)}"
-            )
-            return
-        for record, vector in zip(records, vectors):
-            record.embedding_provider_id = provider_id
-            record.embedding_dim = len(vector)
-            self.store.vectors[record.id] = normalize_vector(vector)
-        self.store.save()
 
     async def _remember_memory_item(
         self,
@@ -2180,6 +2015,4 @@ class GroupRelationsPlugin(Star):
         return memories
 
     async def terminate(self):
-        if self._provider_options_task and not self._provider_options_task.done():
-            self._provider_options_task.cancel()
         self.store.save()

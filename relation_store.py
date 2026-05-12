@@ -2,17 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import os
 import re
 import time
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
-
-
-VECTOR_SIZE = 256
-
 
 @dataclass
 class RelationRecord:
@@ -30,8 +25,6 @@ class RelationRecord:
     importance: float = 0.6
     created_at: int = field(default_factory=lambda: int(time.time()))
     updated_at: int = field(default_factory=lambda: int(time.time()))
-    embedding_provider_id: str = ""
-    embedding_dim: int = 0
 
     def text(self) -> str:
         parts = [
@@ -152,30 +145,11 @@ def _tokens(text: str) -> list[str]:
     return grams
 
 
-def embed_text(text: str) -> list[float]:
-    vector = [0.0] * VECTOR_SIZE
-    for token in _tokens(text):
-        digest = hashlib.blake2b(token.encode("utf-8"), digest_size=4).digest()
-        index = int.from_bytes(digest, "big") % VECTOR_SIZE
-        vector[index] += 1.0
-    norm = math.sqrt(sum(value * value for value in vector))
-    if norm == 0:
-        return vector
-    return [value / norm for value in vector]
-
-
-def cosine(left: list[float], right: list[float]) -> float:
-    if len(left) != len(right):
-        return 0.0
-    return sum(a * b for a, b in zip(left, right))
-
-
 class RelationStore:
     def __init__(self, data_dir: Path):
         self.data_dir = data_dir
         self.data_file = data_dir / "relations.json"
         self.records: dict[str, RelationRecord] = {}
-        self.vectors: dict[str, list[float]] = {}
         self.groups: dict[str, GroupMemorySpace] = {}
         self.profiles: dict[str, UserProfile] = {}
         self.members: dict[str, GroupMember] = {}
@@ -184,7 +158,6 @@ class RelationStore:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         if not self.data_file.exists():
             self.records = {}
-            self.vectors = {}
             self.groups = {}
             self.profiles = {}
             self.members = {}
@@ -193,7 +166,6 @@ class RelationStore:
             payload = json.loads(self.data_file.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             self.records = {}
-            self.vectors = {}
             self.groups = {}
             self.profiles = {}
             self.members = {}
@@ -219,16 +191,6 @@ class RelationStore:
             member = self._coerce_member(item)
             if member:
                 self.members[member.id] = member
-        self.vectors = {
-            record_id: vector
-            for record_id, vector in payload.get("vectors", {}).items()
-            if record_id in self.records
-            and isinstance(vector, list)
-            and all(isinstance(value, int | float) for value in vector)
-        }
-        for record_id, record in self.records.items():
-            if record_id not in self.vectors:
-                self.vectors[record_id] = embed_text(record.text())
         self._ensure_groups()
 
     def _coerce_group(self, item: Any) -> GroupMemorySpace | None:
@@ -309,7 +271,6 @@ class RelationStore:
             payload["importance"] = clamp_confidence(payload.get("importance", 0.6), 0.6)
             payload["created_at"] = int(payload.get("created_at") or time.time())
             payload["updated_at"] = int(payload.get("updated_at") or payload["created_at"])
-            payload["embedding_dim"] = int(payload.get("embedding_dim") or 0)
             return RelationRecord(**payload)
         except (TypeError, ValueError):
             return None
@@ -321,7 +282,6 @@ class RelationStore:
             "members": [asdict(member) for member in self.members.values()],
             "profiles": [asdict(profile) for profile in self.profiles.values()],
             "relations": [asdict(record) for record in self.records.values()],
-            "vectors": self.vectors,
         }
         tmp_file = self.data_file.with_suffix(".json.tmp")
         tmp_file.write_text(
@@ -766,8 +726,6 @@ class RelationStore:
         source: str = "manual",
         confidence: float = 1.0,
         importance: float = 0.6,
-        vector: list[float] | None = None,
-        embedding_provider_id: str = "",
     ) -> RelationRecord:
         subject_user_id = str(subject_user_id or "").strip()
         object_user_id = str(object_user_id or "").strip()
@@ -784,10 +742,6 @@ class RelationStore:
             existing.confidence = max(existing.confidence, clamp_confidence(confidence))
             existing.importance = max(existing.importance, clamp_confidence(importance, 0.6))
             existing.updated_at = now
-            if embedding_provider_id:
-                existing.embedding_provider_id = embedding_provider_id
-            if vector is not None:
-                existing.embedding_dim = len(vector)
             record = existing
         else:
             record = RelationRecord(
@@ -803,13 +757,8 @@ class RelationStore:
                 source=source,
                 confidence=clamp_confidence(confidence),
                 importance=clamp_confidence(importance, 0.6),
-                embedding_provider_id=embedding_provider_id,
-                embedding_dim=len(vector or []),
             )
             self.records[rid] = record
-        self.vectors[rid] = (
-            normalize_vector(vector) if vector is not None else embed_text(record.text())
-        )
         self.save()
         return record
 
@@ -818,7 +767,6 @@ class RelationStore:
         if not record or (group_id and record.group_id != group_id):
             return False
         del self.records[relation_id_]
-        self.vectors.pop(relation_id_, None)
         self.save()
         return True
 
@@ -835,8 +783,6 @@ class RelationStore:
         note: str | None = None,
         confidence: float | None = None,
         importance: float | None = None,
-        vector: list[float] | None = None,
-        embedding_provider_id: str = "",
     ) -> RelationRecord | None:
         record = self.records.get(relation_id_)
         if not record or record.group_id != group_id:
@@ -859,13 +805,6 @@ class RelationStore:
             record.confidence = max(0.0, min(1.0, confidence))
         if importance is not None:
             record.importance = clamp_confidence(importance, 0.6)
-        if embedding_provider_id:
-            record.embedding_provider_id = embedding_provider_id
-        if vector is not None:
-            record.embedding_dim = len(vector)
-            self.vectors[relation_id_] = normalize_vector(vector)
-        else:
-            self.vectors[relation_id_] = embed_text(record.text())
         record.updated_at = int(time.time())
         new_id = relation_id(
             record.group_id,
@@ -877,7 +816,6 @@ class RelationStore:
         )
         if new_id != relation_id_:
             self.records.pop(relation_id_, None)
-            self.vectors.pop(relation_id_, None)
             record.id = new_id
             if new_id in self.records:
                 existing = self.records[new_id]
@@ -889,11 +827,8 @@ class RelationStore:
                 existing.object_user_id = record.object_user_id or existing.object_user_id
                 existing.category = record.category or existing.category
                 existing.updated_at = record.updated_at
-                existing.embedding_provider_id = record.embedding_provider_id
-                existing.embedding_dim = record.embedding_dim
                 record = existing
             self.records[new_id] = record
-            self.vectors[new_id] = normalize_vector(vector) if vector is not None else embed_text(record.text())
         self.save()
         return record
 
@@ -1045,8 +980,6 @@ class RelationStore:
                     target.source = source_label
                     target.confidence = max(target.confidence, source.confidence)
                     target.updated_at = now
-                    target.embedding_provider_id = source.embedding_provider_id
-                    target.embedding_dim = source.embedding_dim
                     target.subject_user_id = source.subject_user_id
                     target.object_user_id = source.object_user_id
                     target.category = source.category
@@ -1067,11 +1000,8 @@ class RelationStore:
                         importance=source.importance,
                         created_at=now,
                         updated_at=now,
-                        embedding_provider_id=source.embedding_provider_id,
-                        embedding_dim=source.embedding_dim,
                     )
                     self.records[target_id] = target
-                self.vectors[target_id] = list(self.vectors.get(source.id) or embed_text(target.text()))
                 changed = True
             if changed:
                 synced.append(group.id)
@@ -1103,16 +1033,6 @@ class RelationStore:
     def recent(self, group_id: str, limit: int = 8) -> list[RelationRecord]:
         records = [record for record in self.records.values() if record.group_id == group_id]
         return sorted(records, key=lambda item: item.updated_at, reverse=True)[:limit]
-
-    def search(
-        self,
-        group_id: str,
-        query: str,
-        limit: int = 8,
-        threshold: float = 0.12,
-    ) -> list[tuple[RelationRecord, float]]:
-        query_vector = embed_text(query)
-        return self.search_by_vector(group_id, query, query_vector, limit=limit, threshold=threshold)
 
     def search_by_text(
         self,
@@ -1147,44 +1067,12 @@ class RelationStore:
         scored.sort(key=lambda item: (item[1], item[0].importance, item[0].updated_at), reverse=True)
         return scored[:limit]
 
-    def search_by_vector(
-        self,
-        group_id: str,
-        query: str,
-        query_vector: list[float],
-        limit: int = 8,
-        threshold: float = 0.12,
-    ) -> list[tuple[RelationRecord, float]]:
-        query_norm_empty = not any(query_vector)
-        scored: list[tuple[RelationRecord, float]] = []
-        for record_id, record in self.records.items():
-            if record.group_id != group_id:
-                continue
-            lexical = 0.25 if normalize_text(query) in normalize_text(record.text()) else 0.0
-            semantic = 0.0 if query_norm_empty else cosine(query_vector, self.vectors.get(record_id, []))
-            score = max(lexical, semantic)
-            if score >= threshold:
-                scored.append((record, score))
-        scored.sort(key=lambda item: (item[1], item[0].importance, item[0].updated_at), reverse=True)
-        return scored[:limit]
-
     def export_group(self, group_id: str) -> list[dict[str, Any]]:
         return [
             asdict(record)
             for record in sorted(self.records.values(), key=lambda item: item.updated_at, reverse=True)
             if record.group_id == group_id
         ]
-
-    def _rebuild_vectors(self) -> None:
-        self.vectors = {record_id: embed_text(record.text()) for record_id, record in self.records.items()}
-
-
-def normalize_vector(vector: list[float]) -> list[float]:
-    norm = math.sqrt(sum(value * value for value in vector))
-    if norm == 0:
-        return vector
-    return [value / norm for value in vector]
-
 
 def format_record(record: RelationRecord, with_id: bool = True) -> str:
     prefix = f"[{record.id}] " if with_id else ""

@@ -184,53 +184,23 @@
     "default": 0.55,
     "hint": "总结提示词会要求模型输出 importance；低于该值的临时小事、当天状态、普通寒暄不会写入。"
   },
-  "召回_优先使用用户ID和文本": {
-    "description": "关系召回是否优先使用 user_id 和文本匹配",
-    "type": "bool",
-    "default": true,
-    "hint": "开启后，每轮注入和工具查询会优先按当前发言人 user_id 召回关系，文本检索只做补充；关闭后才走向量化召回。"
-  },
   "enable_tool_read": {
-    "description": "是否允许模型通过工具查询群关系记忆",
+    "description": "是否允许模型通过工具查询群人物上下文",
     "type": "bool",
     "default": true,
-    "hint": "开启后，支持函数调用的模型可以主动检索群内人物关系。"
+    "hint": "开启后，支持函数调用的模型可以主动按 user_id 查询当前群身份、画像、人物关系和跨群补充。"
   },
   "enable_tool_write": {
-    "description": "是否允许模型通过工具写入群关系记忆",
+    "description": "是否允许模型通过工具写入群人物上下文",
     "type": "bool",
     "default": false,
-    "hint": "开启后，支持函数调用的模型可以主动保存它认为明确的人物关系。建议谨慎开启。"
+    "hint": "开启后，支持函数调用的模型可以主动保存明确的关系和用户画像。建议确认总结逻辑稳定后再打开。"
   },
   "enable_tool_update": {
     "description": "是否允许模型通过工具修改/删除群关系记忆",
     "type": "bool",
     "default": false,
     "hint": "开启后，模型可在用户明确纠正时更新或删除关系。建议与写入工具一起谨慎开启。"
-  },
-  "embedding_provider_id": {
-    "description": "AstrBot 向量化模型 Provider ID",
-    "type": "string",
-    "default": "",
-    "hint": "选择 AstrBot 服务提供商中已配置的 Embedding Provider。留空时自动使用第一个可用 Embedding Provider。",
-    "options": [
-      ""
-    ],
-    "labels": [
-      "自动选择第一个可用 Embedding Provider"
-    ]
-  },
-  "enable_local_embedding_fallback": {
-    "description": "AstrBot 向量化不可用时是否回退到本地哈希向量",
-    "type": "bool",
-    "default": false,
-    "hint": "默认关闭，避免静默使用非 AstrBot 向量。开启后，如果 AstrBot Embedding Provider 不可用，会回退到本地哈希向量。"
-  },
-  "reembed_on_provider_change": {
-    "description": "切换向量化模型后是否自动重建现有关系向量",
-    "type": "bool",
-    "default": false,
-    "hint": "开启后插件启动时会尝试用当前 embedding_provider_id 重建旧关系向量，可能消耗额度。"
   },
   "auto_extract_min_length": {
     "description": "自动抽取的最短消息长度",
@@ -242,23 +212,11 @@
     "type": "int",
     "default": 8
   },
-  "max_embedding_text_length": {
-    "description": "单次向量化文本最大长度",
-    "type": "int",
-    "default": 2000,
-    "hint": "写入和查询都会在调用 Embedding Provider 前截断到该长度，避免触发模型 token 上限。"
-  },
   "max_injected_text_length": {
     "description": "自动注入上下文最大长度",
     "type": "int",
     "default": 1200,
     "hint": "超过该长度会截断，避免关系记忆占用过多上下文。"
-  },
-  "similarity_threshold": {
-    "description": "轻量向量检索阈值",
-    "type": "float",
-    "default": 0.12,
-    "hint": "值越高越严格。使用 AstrBot Embedding Provider 时建议根据模型效果微调。"
   },
   "debug_include_scores": {
     "description": "调试输出是否显示召回分数",
