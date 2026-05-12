@@ -34,8 +34,45 @@ class RelationRecord:
         return " ".join(part for part in parts if part).strip()
 
 
+@dataclass
+class GroupMemorySpace:
+    id: str
+    name: str = ""
+    session_id: str = ""
+    kind: str = "group"
+    created_at: int = field(default_factory=lambda: int(time.time()))
+    updated_at: int = field(default_factory=lambda: int(time.time()))
+    message_count: int = 0
+
+
+@dataclass
+class UserProfile:
+    id: str
+    group_id: str
+    user_id: str
+    display_name: str = ""
+    aliases: list[str] = field(default_factory=list)
+    group_role: str = "unknown"
+    role_evidence: str = ""
+    role_updated_at: int = 0
+    facts: list[dict[str, Any]] = field(default_factory=list)
+    message_count: int = 0
+    created_at: int = field(default_factory=lambda: int(time.time()))
+    updated_at: int = field(default_factory=lambda: int(time.time()))
+
+    def text(self) -> str:
+        fact_text = " ".join(str(item.get("fact") or "") for item in self.facts)
+        parts = [self.display_name, " ".join(self.aliases), self.group_role, fact_text]
+        return " ".join(part for part in parts if part).strip()
+
+
 def normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+
+def profile_id(group_id: str, user_id: str) -> str:
+    raw = f"{group_id}|{normalize_text(user_id)}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
 
 
 def relation_id(group_id: str, subject: str, relation: str, object_: str) -> str:
@@ -88,18 +125,24 @@ class RelationStore:
         self.data_file = data_dir / "relations.json"
         self.records: dict[str, RelationRecord] = {}
         self.vectors: dict[str, list[float]] = {}
+        self.groups: dict[str, GroupMemorySpace] = {}
+        self.profiles: dict[str, UserProfile] = {}
 
     def load(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         if not self.data_file.exists():
             self.records = {}
             self.vectors = {}
+            self.groups = {}
+            self.profiles = {}
             return
         try:
             payload = json.loads(self.data_file.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             self.records = {}
             self.vectors = {}
+            self.groups = {}
+            self.profiles = {}
             return
         records = payload.get("relations", [])
         self.records = {}
@@ -107,6 +150,16 @@ class RelationStore:
             record = self._coerce_record(item)
             if record:
                 self.records[record.id] = record
+        self.groups = {}
+        for item in payload.get("groups", []):
+            group = self._coerce_group(item)
+            if group:
+                self.groups[group.id] = group
+        self.profiles = {}
+        for item in payload.get("profiles", []):
+            profile = self._coerce_profile(item)
+            if profile:
+                self.profiles[profile.id] = profile
         self.vectors = {
             record_id: vector
             for record_id, vector in payload.get("vectors", {}).items()
@@ -117,6 +170,47 @@ class RelationStore:
         for record_id, record in self.records.items():
             if record_id not in self.vectors:
                 self.vectors[record_id] = embed_text(record.text())
+        self._ensure_groups()
+
+    def _coerce_group(self, item: Any) -> GroupMemorySpace | None:
+        if not isinstance(item, dict) or not item.get("id"):
+            return None
+        allowed = {field_.name for field_ in fields(GroupMemorySpace)}
+        payload = {key: value for key, value in item.items() if key in allowed}
+        try:
+            payload["created_at"] = int(payload.get("created_at") or time.time())
+            payload["updated_at"] = int(payload.get("updated_at") or payload["created_at"])
+            payload["message_count"] = int(payload.get("message_count") or 0)
+            return GroupMemorySpace(**payload)
+        except (TypeError, ValueError):
+            return None
+
+    def _coerce_profile(self, item: Any) -> UserProfile | None:
+        if not isinstance(item, dict):
+            return None
+        required = ["id", "group_id", "user_id"]
+        if any(not item.get(key) for key in required):
+            return None
+        allowed = {field_.name for field_ in fields(UserProfile)}
+        payload = {key: value for key, value in item.items() if key in allowed}
+        try:
+            payload["aliases"] = [
+                str(alias).strip()
+                for alias in payload.get("aliases", [])
+                if str(alias).strip()
+            ][:12]
+            payload["facts"] = [
+                fact
+                for fact in payload.get("facts", [])
+                if isinstance(fact, dict) and str(fact.get("fact") or "").strip()
+            ][:50]
+            payload["message_count"] = int(payload.get("message_count") or 0)
+            payload["created_at"] = int(payload.get("created_at") or time.time())
+            payload["updated_at"] = int(payload.get("updated_at") or payload["created_at"])
+            payload["role_updated_at"] = int(payload.get("role_updated_at") or 0)
+            return UserProfile(**payload)
+        except (TypeError, ValueError):
+            return None
 
     def _coerce_record(self, item: Any) -> RelationRecord | None:
         if not isinstance(item, dict):
@@ -138,6 +232,8 @@ class RelationStore:
     def save(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         payload = {
+            "groups": [asdict(group) for group in self.groups.values()],
+            "profiles": [asdict(profile) for profile in self.profiles.values()],
             "relations": [asdict(record) for record in self.records.values()],
             "vectors": self.vectors,
         }
@@ -147,6 +243,270 @@ class RelationStore:
             encoding="utf-8",
         )
         os.replace(tmp_file, self.data_file)
+
+    def _ensure_groups(self) -> None:
+        now = int(time.time())
+        group_ids = {record.group_id for record in self.records.values()}
+        group_ids.update(profile.group_id for profile in self.profiles.values())
+        for group_id in group_ids:
+            if group_id and group_id not in self.groups:
+                self.groups[group_id] = GroupMemorySpace(
+                    id=group_id,
+                    name=group_id,
+                    session_id=group_id,
+                    kind="group",
+                    created_at=now,
+                    updated_at=now,
+                )
+
+    def touch_group(
+        self,
+        group_id: str,
+        name: str = "",
+        session_id: str = "",
+        kind: str = "group",
+    ) -> GroupMemorySpace:
+        now = int(time.time())
+        group = self.groups.get(group_id)
+        if not group:
+            group = GroupMemorySpace(
+                id=group_id,
+                name=name.strip(),
+                session_id=session_id.strip(),
+                kind=kind.strip() or "group",
+                created_at=now,
+                updated_at=now,
+            )
+            self.groups[group_id] = group
+        else:
+            if name.strip():
+                group.name = name.strip()
+            if session_id.strip():
+                group.session_id = session_id.strip()
+            if kind.strip():
+                group.kind = kind.strip()
+            group.updated_at = now
+        group.message_count += 1
+        self.save()
+        return group
+
+    def update_group(
+        self,
+        group_id: str,
+        name: str | None = None,
+        kind: str | None = None,
+    ) -> GroupMemorySpace | None:
+        group = self.groups.get(group_id)
+        if not group:
+            return None
+        if name is not None:
+            group.name = name.strip()
+        if kind is not None and kind.strip():
+            group.kind = kind.strip()
+        group.updated_at = int(time.time())
+        self.save()
+        return group
+
+    def touch_profile(
+        self,
+        group_id: str,
+        user_id: str,
+        display_name: str = "",
+        group_role: str = "",
+        role_evidence: str = "",
+    ) -> UserProfile:
+        now = int(time.time())
+        pid = profile_id(group_id, user_id)
+        profile = self.profiles.get(pid)
+        display_name = display_name.strip()
+        group_role = group_role.strip().lower()
+        role_evidence = role_evidence.strip()
+        if not profile:
+            profile = UserProfile(
+                id=pid,
+                group_id=group_id,
+                user_id=str(user_id).strip(),
+                display_name=display_name,
+                aliases=[display_name] if display_name else [],
+                group_role=group_role or "unknown",
+                role_evidence=role_evidence,
+                role_updated_at=now if group_role else 0,
+                created_at=now,
+                updated_at=now,
+            )
+            self.profiles[pid] = profile
+        else:
+            if display_name:
+                profile.display_name = display_name
+                if display_name not in profile.aliases:
+                    profile.aliases.insert(0, display_name)
+                    profile.aliases = profile.aliases[:12]
+            if group_role and (not profile.group_role or profile.group_role == "unknown"):
+                profile.group_role = group_role
+                profile.role_evidence = role_evidence
+                profile.role_updated_at = now
+            profile.updated_at = now
+        profile.message_count += 1
+        self.save()
+        return profile
+
+    def remember_profile_fact(
+        self,
+        group_id: str,
+        user_id: str,
+        display_name: str,
+        fact: str,
+        note: str = "",
+        source: str = "manual",
+        confidence: float = 0.8,
+    ) -> UserProfile:
+        profile = self.touch_profile(group_id, user_id, display_name)
+        fact = re.sub(r"\s+", " ", fact).strip()
+        if not fact:
+            return profile
+        now = int(time.time())
+        norm = normalize_text(fact)
+        existing = next(
+            (
+                item
+                for item in profile.facts
+                if normalize_text(str(item.get("fact") or "")) == norm
+            ),
+            None,
+        )
+        if existing:
+            existing["note"] = note.strip() or existing.get("note", "")
+            existing["source"] = source or existing.get("source", "manual")
+            existing["confidence"] = max(
+                clamp_confidence(existing.get("confidence", 0.0)),
+                clamp_confidence(confidence, 0.8),
+            )
+            existing["updated_at"] = now
+        else:
+            profile.facts.insert(
+                0,
+                {
+                    "fact": fact[:160],
+                    "note": note.strip()[:240],
+                    "source": source,
+                    "confidence": clamp_confidence(confidence, 0.8),
+                    "created_at": now,
+                    "updated_at": now,
+                },
+            )
+            profile.facts = profile.facts[:50]
+        profile.updated_at = now
+        self.save()
+        return profile
+
+    def update_profile(
+        self,
+        profile_id_: str,
+        group_id: str,
+        display_name: str | None = None,
+        aliases: list[str] | None = None,
+        group_role: str | None = None,
+        role_evidence: str | None = None,
+    ) -> UserProfile | None:
+        profile = self.profiles.get(profile_id_)
+        if not profile or profile.group_id != group_id:
+            return None
+        if display_name is not None:
+            profile.display_name = display_name.strip()
+        if aliases is not None:
+            clean_aliases = []
+            for alias in aliases:
+                alias = str(alias).strip()
+                if alias and alias not in clean_aliases:
+                    clean_aliases.append(alias)
+            if profile.display_name and profile.display_name not in clean_aliases:
+                clean_aliases.insert(0, profile.display_name)
+            profile.aliases = clean_aliases[:12]
+        if group_role is not None and group_role.strip():
+            profile.group_role = group_role.strip().lower()
+            profile.role_evidence = (role_evidence or "webui").strip()
+            profile.role_updated_at = int(time.time())
+        profile.updated_at = int(time.time())
+        self.save()
+        return profile
+
+    def update_profile_fact(
+        self,
+        profile_id_: str,
+        group_id: str,
+        index: int,
+        fact: str | None = None,
+        note: str | None = None,
+        confidence: float | None = None,
+    ) -> UserProfile | None:
+        profile = self.profiles.get(profile_id_)
+        if not profile or profile.group_id != group_id:
+            return None
+        if index < 0 or index >= len(profile.facts):
+            return None
+        item = profile.facts[index]
+        if fact is not None:
+            fact = re.sub(r"\s+", " ", fact).strip()
+            if not fact:
+                return None
+            item["fact"] = fact[:160]
+        if note is not None:
+            item["note"] = note.strip()[:240]
+        if confidence is not None:
+            item["confidence"] = clamp_confidence(confidence, 0.8)
+        item["updated_at"] = int(time.time())
+        profile.updated_at = int(time.time())
+        self.save()
+        return profile
+
+    def delete_profile(self, profile_id_: str, group_id: str) -> bool:
+        profile = self.profiles.get(profile_id_)
+        if not profile or profile.group_id != group_id:
+            return False
+        del self.profiles[profile_id_]
+        self.save()
+        return True
+
+    def delete_profile_facts(
+        self,
+        profile_id_: str,
+        group_id: str,
+        fact_query: str,
+    ) -> int:
+        profile = self.profiles.get(profile_id_)
+        if not profile or profile.group_id != group_id:
+            return 0
+        query_norm = normalize_text(fact_query)
+        if not query_norm:
+            return 0
+        old_count = len(profile.facts)
+        profile.facts = [
+            item
+            for item in profile.facts
+            if query_norm not in normalize_text(str(item.get("fact") or ""))
+            and query_norm not in normalize_text(str(item.get("note") or ""))
+        ]
+        deleted = old_count - len(profile.facts)
+        if deleted:
+            profile.updated_at = int(time.time())
+            self.save()
+        return deleted
+
+    def delete_profile_fact_index(
+        self,
+        profile_id_: str,
+        group_id: str,
+        index: int,
+    ) -> bool:
+        profile = self.profiles.get(profile_id_)
+        if not profile or profile.group_id != group_id:
+            return False
+        if index < 0 or index >= len(profile.facts):
+            return False
+        profile.facts.pop(index)
+        profile.updated_at = int(time.time())
+        self.save()
+        return True
 
     def upsert(
         self,
@@ -264,6 +624,51 @@ class RelationStore:
         ]
         return sorted(matches, key=lambda item: item.updated_at, reverse=True)[:limit]
 
+    def get_profile(self, group_id: str, user_id: str) -> UserProfile | None:
+        return self.profiles.get(profile_id(group_id, user_id))
+
+    def find_profiles(
+        self,
+        group_id: str,
+        query: str = "",
+        limit: int = 8,
+    ) -> list[UserProfile]:
+        query_norm = normalize_text(query)
+        matches = [
+            profile
+            for profile in self.profiles.values()
+            if profile.group_id == group_id
+            and (
+                not query_norm
+                or query_norm in normalize_text(profile.user_id)
+                or query_norm in normalize_text(profile.display_name)
+                or any(query_norm in normalize_text(alias) for alias in profile.aliases)
+                or query_norm in normalize_text(profile.text())
+            )
+        ]
+        return sorted(matches, key=lambda item: item.updated_at, reverse=True)[:limit]
+
+    def export_profiles(self, group_id: str) -> list[dict[str, Any]]:
+        return [
+            asdict(profile)
+            for profile in sorted(
+                self.profiles.values(),
+                key=lambda item: item.updated_at,
+                reverse=True,
+            )
+            if profile.group_id == group_id
+        ]
+
+    def export_groups(self) -> list[dict[str, Any]]:
+        return [
+            asdict(group)
+            for group in sorted(
+                self.groups.values(),
+                key=lambda item: item.updated_at,
+                reverse=True,
+            )
+        ]
+
     def recent(self, group_id: str, limit: int = 8) -> list[RelationRecord]:
         records = [record for record in self.records.values() if record.group_id == group_id]
         return sorted(records, key=lambda item: item.updated_at, reverse=True)[:limit]
@@ -348,3 +753,16 @@ def format_record(record: RelationRecord, with_id: bool = True) -> str:
     prefix = f"[{record.id}] " if with_id else ""
     note = f"（{record.note}）" if record.note else ""
     return f"{prefix}{record.subject} --{record.relation}--> {record.object}{note}"
+
+
+def format_profile(profile: UserProfile, max_facts: int = 5) -> str:
+    name = profile.display_name or profile.user_id
+    alias_text = f" aliases={','.join(profile.aliases[:4])}" if profile.aliases else ""
+    role_text = f" role={profile.group_role}" if profile.group_role else ""
+    facts = [
+        str(item.get("fact") or "").strip()
+        for item in profile.facts[:max_facts]
+        if str(item.get("fact") or "").strip()
+    ]
+    fact_text = "；".join(facts) if facts else "暂无画像事实"
+    return f"[{profile.user_id}] {name}{role_text}{alias_text}：{fact_text}"

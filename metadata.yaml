@@ -1,11 +1,11 @@
 name: astrbot_plugin_group_relations
 desc: Group relationship memory for AstrBot.
 help: Use /关系 help to manage and query relationship memory.
-version: v0.1.0
+version: v0.3.0
 author: Codex
 repo: "https://github.com/yun474/astrbot_plugin_group_relations"
 display_name: 群关系记忆
-short_desc: 让机器人记住群内人物关系、身份和关联。
+short_desc: 分群管理群内人物关系、身份和用户画像。
 astrbot_version: ">=4.9.2"
 support_platforms:
   - aiocqhttp

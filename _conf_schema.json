@@ -11,20 +11,26 @@
     "default": false,
     "hint": "开启后，插件会定期把最近几轮对话交给 LLM 总结，抽取明确的人物关系并写入记忆。"
   },
-  "summary_trigger_rounds": {
+  "自动总结_触发轮数": {
     "description": "自动总结触发轮数",
     "type": "int",
     "default": 6,
     "hint": "一轮约等于一次用户消息和一次机器人回复。建议 4-10。"
   },
-  "summary_provider_id": {
+  "自动总结_模型Provider": {
     "description": "自动总结使用的 LLM Provider",
     "type": "string",
     "_special": "select_provider",
     "default": "",
     "hint": "留空时使用当前会话正在使用的聊天模型。建议选择便宜、稳定、擅长结构化抽取的模型。"
   },
-  "summary_max_dialogue_chars": {
+  "自动总结_人格提示词": {
+    "description": "自动总结时传给模型的人格提示词",
+    "type": "text",
+    "default": "",
+    "hint": "可选。用于帮助总结模型理解机器人在群内的称呼、说话风格和人设边界；只作为理解语境的辅助，不会被直接当作记忆事实写入。"
+  },
+  "自动总结_最大对话长度": {
     "description": "自动总结最大对话长度",
     "type": "int",
     "default": 4000,
@@ -39,24 +45,30 @@
   "memory_scope": {
     "description": "记忆隔离范围",
     "type": "string",
-    "default": "session",
+    "default": "group",
     "options": [
       "session",
       "group",
       "global"
     ],
     "labels": [
-      "按会话隔离（推荐，群聊/私聊各自独立）",
-      "按群隔离（仅群聊隔离，私聊按会话）",
+      "按会话隔离（群聊/私聊各自独立）",
+      "按群隔离（推荐，群聊按群统一管理，私聊按会话）",
       "全局共享（所有会话共用）"
     ],
-    "hint": "推荐 session：群聊和私聊都会拥有独立关系记忆，也更容易让 LLM 理解当前正在哪个会话中。"
+    "hint": "推荐 group：同一个群里的关系和用户画像会进入同一个群空间，便于分群管理；私聊仍按会话隔离。"
   },
   "enable_session_identity_injection": {
     "description": "是否注入当前会话身份说明",
     "type": "bool",
     "default": true,
     "hint": "开启后，会明确告诉 LLM 当前是在某个群聊或私聊中、群名/会话名是什么、发言人是谁。"
+  },
+  "bot_relation_aliases": {
+    "description": "机器人在关系记忆中的可能称呼",
+    "type": "string",
+    "default": "机器人,AI,助手,本机器人,AstrBot",
+    "hint": "用于检索“机器人自己”和群友的关系。多个称呼可用英文逗号或换行分隔，例如云云,机器人,AI。"
   },
   "relation_admin_user_ids": {
     "description": "允许使用 /关系 调试指令的用户 ID",
@@ -70,11 +82,17 @@
     "default": false,
     "hint": "开启后，任何成员都可以查看当前会话的关系记忆、状态和召回结果。只建议在测试群临时开启。"
   },
-  "injection_top_k": {
+  "记忆管理_每轮注入关系数量": {
     "description": "每轮自动注入的关系数量",
     "type": "int",
     "default": 5,
     "hint": "建议 3-8。过大会增加 token 消耗，也可能干扰回答。"
+  },
+  "记忆管理_每人关系召回上限": {
+    "description": "每个发言人每轮最多召回的直接关系数量",
+    "type": "int",
+    "default": 8,
+    "hint": "限制当前发言人直接相关关系的数量，避免活跃用户的关系占满上下文。"
   },
   "enable_person_profile": {
     "description": "是否生成简易人物画像",
@@ -82,10 +100,46 @@
     "default": true,
     "hint": "开启后，会从当前召回关系中整理当前发言人的简短画像。"
   },
-  "person_profile_max_items": {
-    "description": "人物画像最多使用的关系条数",
+  "记忆管理_当前发言人画像条数": {
+    "description": "当前发言人画像最多注入条数",
     "type": "int",
-    "default": 4
+    "default": 4,
+    "hint": "每轮注入当前发言人的身份、印象、记忆等画像事实数量。"
+  },
+  "记忆管理_相关人物画像注入人数": {
+    "description": "每轮注入的相关人物画像数量",
+    "type": "int",
+    "default": 4,
+    "hint": "根据召回到的关系主体/客体补充相关人物画像，帮助模型理解当前发言人与相关群友。"
+  },
+  "记忆管理_画像查询返回人数": {
+    "description": "查询用户画像时返回的最大用户数",
+    "type": "int",
+    "default": 5
+  },
+  "记忆管理_每人记忆上限": {
+    "description": "每个用户最多保留的画像事实/长期记忆数量",
+    "type": "int",
+    "default": 20,
+    "hint": "用于限制一个人的长期记忆、个人印象、偏好等画像事实总量；超过后优先保留较新的内容。"
+  },
+  "记忆管理_每轮记忆更新操作上限": {
+    "description": "每轮总结最多执行的记忆更新数量",
+    "type": "int",
+    "default": 6,
+    "hint": "限制总结模型一次输出过多新增/更新操作，避免脏记忆膨胀。"
+  },
+  "记忆管理_写入可信度阈值": {
+    "description": "记忆写入最低可信度",
+    "type": "float",
+    "default": 0.65,
+    "hint": "总结或抽取结果低于该可信度时不写入。"
+  },
+  "群身份_初始化扫描": {
+    "description": "是否在初始化时扫描/归纳群身份",
+    "type": "bool",
+    "default": true,
+    "hint": "只在刚创建群空间或当前发言人没有身份记录时尝试归纳群主/管理/群友；已有身份后不会反复扫描。"
   },
   "enable_tool_read": {
     "description": "是否允许模型通过工具查询群关系记忆",

@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>群关系记忆管理</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div>
+            <h1>群关系记忆</h1>
+            <p id="pluginName">astrbot_plugin_group_relations</p>
+          </div>
+          <button class="icon-button" id="refreshButton" title="刷新">↻</button>
+        </div>
+        <label class="search">
+          <span>筛选群</span>
+          <input id="groupFilter" type="search" placeholder="群名 / ID" />
+        </label>
+        <div class="group-list" id="groupList"></div>
+      </aside>
+
+      <main class="content">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">当前群空间</p>
+            <h2 id="groupTitle">未选择</h2>
+          </div>
+          <div class="stats" id="stats"></div>
+        </header>
+
+        <section class="panel" id="groupPanel">
+          <div class="section-head">
+            <h3>群空间</h3>
+            <button class="primary" id="saveGroupButton">保存群信息</button>
+          </div>
+          <div class="grid two">
+            <label>
+              <span>显示名称</span>
+              <input id="groupName" />
+            </label>
+            <label>
+              <span>类型</span>
+              <select id="groupKind">
+                <option value="group">群聊</option>
+                <option value="private">私聊</option>
+                <option value="global">全局</option>
+              </select>
+            </label>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="section-head">
+            <h3>关系</h3>
+            <button class="primary" id="addRelationButton">新增关系</button>
+          </div>
+          <div class="table" id="relationTable"></div>
+        </section>
+
+        <section class="panel">
+          <div class="section-head">
+            <h3>用户画像</h3>
+            <button class="primary" id="addProfileButton">新增画像</button>
+          </div>
+          <div class="profiles" id="profileList"></div>
+        </section>
+      </main>
+    </div>
+
+    <div class="toast" id="toast" hidden></div>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

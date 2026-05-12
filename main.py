@@ -4,6 +4,8 @@ import asyncio
 import json
 from pathlib import Path
 
+from quart import jsonify, request
+
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import LLMResponse, ProviderRequest
@@ -16,6 +18,7 @@ from .relation_store import (
     RelationRecord,
     RelationStore,
     embed_text,
+    format_profile,
     format_record,
     normalize_vector,
 )
@@ -35,8 +38,17 @@ def _group_name(event: AstrMessageEvent) -> str:
     return str(getattr(group, "group_name", "") or "")
 
 
+def _is_group_event(event: AstrMessageEvent) -> bool:
+    message_obj = getattr(event, "message_obj", None)
+    return bool(getattr(message_obj, "group_id", "") if message_obj else False)
+
+
 def _sender_name(event: AstrMessageEvent) -> str:
     return str(event.get_sender_name() or event.get_sender_id() or "未知成员")
+
+
+def _sender_id(event: AstrMessageEvent) -> str:
+    return str(event.get_sender_id() or _sender_name(event) or "unknown")
 
 
 def _split_config_list(value) -> set[str]:
@@ -63,12 +75,41 @@ class GroupRelationsPlugin(Star):
         self._provider_options_task: asyncio.Task | None = None
         self._summary_buffers: dict[str, list[dict[str, str]]] = {}
         self._refresh_embedding_provider_options()
+        self._register_web_apis()
         try:
             self._provider_options_task = asyncio.create_task(
                 self._refresh_embedding_provider_options_later()
             )
         except RuntimeError:
             self._provider_options_task = None
+
+    def _cfg(self, primary: str, fallback: str | None = None, default=None):
+        value = self.config.get(primary, None)
+        if value is not None and value != "":
+            return value
+        if fallback:
+            value = self.config.get(fallback, None)
+            if value is not None and value != "":
+                return value
+        return default
+
+    def _cfg_int(self, primary: str, fallback: str | None = None, default: int = 0) -> int:
+        try:
+            return int(self._cfg(primary, fallback, default))
+        except (TypeError, ValueError):
+            return default
+
+    def _cfg_float(self, primary: str, fallback: str | None = None, default: float = 0.0) -> float:
+        try:
+            return float(self._cfg(primary, fallback, default))
+        except (TypeError, ValueError):
+            return default
+
+    def _cfg_bool(self, primary: str, fallback: str | None = None, default: bool = False) -> bool:
+        value = self._cfg(primary, fallback, default)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on", "开启", "是"}
+        return bool(value)
 
     @filter.command_group("关系")
     def relations(self):
@@ -84,6 +125,10 @@ class GroupRelationsPlugin(Star):
                     "群关系插件主要通过 LLM 自动注入和工具调用工作。",
                     "调试指令：",
                     "/关系 状态",
+                    "/关系 群",
+                    "/关系 用户 [用户ID或昵称]",
+                    "/关系 画像 [用户ID或昵称]",
+                    "/关系 删除画像 <用户ID或昵称> [画像关键词]",
                     "/关系 调试 <查询词>",
                     "/关系 最近",
                     "/关系 向量",
@@ -97,25 +142,111 @@ class GroupRelationsPlugin(Star):
         if not self._can_use_debug_commands(event):
             yield event.plain_result(self._debug_denied_message())
             return
+        self._touch_event_scope(event)
         provider = self._get_embedding_provider(silent=True)
+        scope_id = self._scope_id(event)
         yield event.plain_result(
             "\n".join(
                 [
                     f"自动注入：{bool(self.config.get('enable_context_injection', True))}",
                     f"自动总结：{bool(self.config.get('enable_dialogue_summary', False))}",
-                    f"总结轮数：{int(self.config.get('summary_trigger_rounds', 6))}",
-                    f"注入条数：{int(self.config.get('injection_top_k', 5))}",
+                    f"总结轮数：{self._cfg_int('自动总结_触发轮数', 'summary_trigger_rounds', 6)}",
+                    f"注入条数：{self._cfg_int('记忆管理_每轮注入关系数量', 'injection_top_k', 5)}",
                     f"人物画像：{bool(self.config.get('enable_person_profile', True))}",
                     f"工具读取：{bool(self.config.get('enable_tool_read', True))}",
                     f"工具写入：{bool(self.config.get('enable_tool_write', False))}",
                     f"工具修改/删除：{bool(self.config.get('enable_tool_update', False))}",
-                    f"记忆隔离：{self.config.get('memory_scope', 'session')}",
+                    f"记忆隔离：{self.config.get('memory_scope', 'group')}",
                     f"Embedding Provider：{provider.meta().id if provider else '不可用'}",
                     f"向量本地回退：{bool(self.config.get('enable_local_embedding_fallback', False))}",
-                    f"总结 Provider：{self.config.get('summary_provider_id', '') or '当前会话模型'}",
-                    f"当前会话关系数：{len(self.store.export_group(self._scope_id(event)))}",
+                    f"总结 Provider：{self._cfg('自动总结_模型Provider', 'summary_provider_id', '') or '当前会话模型'}",
+                    f"总结人格提示词：{'已配置' if str(self._cfg('自动总结_人格提示词', 'summary_personality_prompt', '')).strip() else '未配置'}",
+                    f"已记录群空间：{len(self.store.groups)}",
+                    f"当前群关系数：{len(self.store.export_group(scope_id))}",
+                    f"当前群用户画像数：{len(self.store.export_profiles(scope_id))}",
                 ]
             )
+        )
+
+    @relations.command("群")
+    async def group_status(self, event: AstrMessageEvent):
+        """查看当前群空间概况。"""
+        if not self._can_use_debug_commands(event):
+            yield event.plain_result(self._debug_denied_message())
+            return
+        group = self._touch_event_scope(event)
+        scope_id = self._scope_id(event)
+        profiles = self.store.find_profiles(scope_id, limit=5)
+        lines = [
+            f"群空间：{group.name or group.id}",
+            f"空间ID：{group.id}",
+            f"类型：{group.kind}",
+            f"消息触达：{group.message_count}",
+            f"关系数：{len(self.store.export_group(scope_id))}",
+            f"用户画像数：{len(self.store.export_profiles(scope_id))}",
+        ]
+        if profiles:
+            lines.extend(["", "最近活跃用户画像："])
+            lines.extend(format_profile(profile, max_facts=2) for profile in profiles)
+        yield event.plain_result("\n".join(lines))
+
+    @relations.command("用户")
+    async def user_profile(self, event: AstrMessageEvent, query: str = ""):
+        """查看当前群内用户画像。"""
+        if not self._can_use_debug_commands(event):
+            yield event.plain_result(self._debug_denied_message())
+            return
+        yield event.plain_result(self._format_profile_query_result(event, query))
+
+    @relations.command("画像")
+    async def profile(self, event: AstrMessageEvent, query: str = ""):
+        """查看当前群内用户画像。"""
+        if not self._can_use_debug_commands(event):
+            yield event.plain_result(self._debug_denied_message())
+            return
+        yield event.plain_result(self._format_profile_query_result(event, query))
+
+    @relations.command("删除画像")
+    async def delete_profile(self, event: AstrMessageEvent, query: str = "", fact_query: str = ""):
+        """删除当前群内用户画像或画像事实。"""
+        if not self._can_use_debug_commands(event):
+            yield event.plain_result(self._debug_denied_message())
+            return
+        self._touch_event_scope(event)
+        query = query.strip()
+        fact_query = fact_query.strip()
+        if not query:
+            yield event.plain_result("用法：/关系 删除画像 <用户ID或昵称> [画像关键词]")
+            return
+        profiles = self.store.find_profiles(
+            self._scope_id(event),
+            query=query,
+            limit=self._cfg_int("记忆管理_画像查询返回人数", "max_profile_results", 5),
+        )
+        if not profiles:
+            yield event.plain_result(f"没有找到「{query}」的群内画像。")
+            return
+        if len(profiles) > 1 and not any(profile.user_id == query or profile.id == query for profile in profiles):
+            lines = ["匹配到多个画像，请用更准确的用户ID或昵称："]
+            lines.extend(format_profile(profile, max_facts=2) for profile in profiles)
+            yield event.plain_result("\n".join(lines))
+            return
+        profile = next(
+            (item for item in profiles if item.user_id == query or item.id == query),
+            profiles[0],
+        )
+        if fact_query:
+            deleted = self.store.delete_profile_facts(profile.id, self._scope_id(event), fact_query)
+            if not deleted:
+                yield event.plain_result(f"没有删掉画像事实：{profile.display_name or profile.user_id} / {fact_query}")
+                return
+            yield event.plain_result(f"已删除 {profile.display_name or profile.user_id} 的 {deleted} 条画像事实。")
+            return
+        ok = self.store.delete_profile(profile.id, self._scope_id(event))
+        yield event.plain_result(
+            f"已删除 {profile.display_name or profile.user_id} 的群内画像。"
+            if ok
+            else "删除失败，画像可能已经不存在。"
         )
 
     @relations.command("调试")
@@ -188,19 +319,289 @@ class GroupRelationsPlugin(Star):
             f"当前使用 AstrBot Embedding Provider：{provider_id}，维度：{provider.get_dim()}"
         )
 
+    def _register_web_apis(self) -> None:
+        register = getattr(self.context, "register_web_api", None)
+        if not callable(register):
+            logger.warning("group relation WebUI disabled: context.register_web_api is unavailable.")
+            return
+        routes = [
+            ("memory", self.web_memory, ["GET"], "Group relation memory overview"),
+            ("group-save", self.web_group_save, ["POST"], "Update group memory space"),
+            ("relation-save", self.web_relation_save, ["POST"], "Create or update group relation"),
+            ("relation-delete", self.web_relation_delete, ["POST"], "Delete group relation"),
+            ("profile-save", self.web_profile_save, ["POST"], "Create or update group user profile"),
+            ("profile-fact-save", self.web_profile_fact_save, ["POST"], "Create or update group user profile fact"),
+            ("profile-fact-delete", self.web_profile_fact_delete, ["POST"], "Delete group user profile fact"),
+            ("profile-delete", self.web_profile_delete, ["POST"], "Delete group user profile"),
+        ]
+        for endpoint, handler, methods, description in routes:
+            try:
+                register(f"/{PLUGIN_NAME}/{endpoint}", handler, methods, description)
+            except Exception as exc:
+                logger.warning(f"group relation failed to register WebUI API `{endpoint}`: {exc}")
+
+    async def _web_request_json(self) -> dict:
+        payload = await request.get_json(silent=True)
+        return payload if isinstance(payload, dict) else {}
+
+    def _web_ok(self, **payload):
+        payload["ok"] = True
+        return jsonify(payload)
+
+    def _web_error(self, message: str, status: int = 400):
+        return jsonify({"ok": False, "error": message}), status
+
+    def _web_group_payload(self, group_id: str) -> dict:
+        group = self.store.groups.get(group_id)
+        relation_count = len(self.store.export_group(group_id))
+        profile_count = len(self.store.export_profiles(group_id))
+        payload = {
+            "id": group_id,
+            "name": group.name if group else group_id,
+            "session_id": group.session_id if group else group_id,
+            "kind": group.kind if group else "group",
+            "created_at": group.created_at if group else 0,
+            "updated_at": group.updated_at if group else 0,
+            "message_count": group.message_count if group else 0,
+            "relation_count": relation_count,
+            "profile_count": profile_count,
+        }
+        return payload
+
+    def _web_profile_payload(self, profile: dict) -> dict:
+        profile = dict(profile)
+        facts = []
+        for index, item in enumerate(profile.get("facts", [])):
+            if not isinstance(item, dict):
+                continue
+            fact = dict(item)
+            fact["index"] = index
+            facts.append(fact)
+        profile["facts"] = facts
+        return profile
+
+    def _web_memory_payload(self, selected_group_id: str = "") -> dict:
+        self.store._ensure_groups()
+        groups = [self._web_group_payload(group["id"]) for group in self.store.export_groups()]
+        groups.sort(key=lambda item: (item["updated_at"], item["message_count"]), reverse=True)
+        if not selected_group_id and groups:
+            selected_group_id = groups[0]["id"]
+        selected = self._web_group_payload(selected_group_id) if selected_group_id else None
+        relations = self.store.export_group(selected_group_id) if selected_group_id else []
+        profiles = [
+            self._web_profile_payload(profile)
+            for profile in self.store.export_profiles(selected_group_id)
+        ] if selected_group_id else []
+        return {
+            "plugin": PLUGIN_NAME,
+            "groups": groups,
+            "selected_group_id": selected_group_id,
+            "selected_group": selected,
+            "relations": relations,
+            "profiles": profiles,
+        }
+
+    async def web_memory(self):
+        group_id = str(request.args.get("group_id", "") or "").strip()
+        return jsonify(self._web_memory_payload(group_id))
+
+    async def web_group_save(self):
+        data = await self._web_request_json()
+        group_id = str(data.get("group_id") or "").strip()
+        if not group_id:
+            return self._web_error("missing group_id")
+        group = self.store.update_group(
+            group_id=group_id,
+            name=str(data.get("name", "")),
+            kind=str(data.get("kind", "") or "group"),
+        )
+        if not group:
+            return self._web_error("group not found", 404)
+        return self._web_ok(memory=self._web_memory_payload(group_id))
+
+    async def web_relation_save(self):
+        data = await self._web_request_json()
+        group_id = str(data.get("group_id") or "").strip()
+        if not group_id:
+            return self._web_error("missing group_id")
+        relation_id_ = str(data.get("id") or data.get("relation_id") or "").strip()
+        subject = str(data.get("subject") or "").strip()
+        relation = str(data.get("relation") or "").strip()
+        object_ = str(data.get("object") or data.get("object_") or "").strip()
+        note = str(data.get("note") or "").strip()
+        try:
+            confidence = float(data.get("confidence", 0.8))
+        except (TypeError, ValueError):
+            confidence = 0.8
+        text = " ".join(part for part in [subject, relation, object_, note] if part)
+        if not text:
+            return self._web_error("relation content is empty")
+        vector, provider_id = await self._embed(text)
+        if relation_id_:
+            updated = self.store.update(
+                relation_id_,
+                group_id=group_id,
+                subject=subject or None,
+                relation=relation or None,
+                object_=object_ or None,
+                note=note,
+                confidence=confidence,
+                vector=vector,
+                embedding_provider_id=provider_id,
+            )
+            if not updated:
+                return self._web_error("relation not found", 404)
+        else:
+            if not subject or not relation or not object_:
+                return self._web_error("subject, relation and object are required")
+            self.store.upsert(
+                group_id=group_id,
+                subject=subject,
+                relation=relation,
+                object_=object_,
+                note=note,
+                source="webui",
+                confidence=confidence,
+                vector=vector,
+                embedding_provider_id=provider_id,
+            )
+        return self._web_ok(memory=self._web_memory_payload(group_id))
+
+    async def web_relation_delete(self):
+        data = await self._web_request_json()
+        group_id = str(data.get("group_id") or "").strip()
+        relation_id_ = str(data.get("id") or data.get("relation_id") or "").strip()
+        if not group_id or not relation_id_:
+            return self._web_error("missing group_id or relation_id")
+        if not self.store.delete(relation_id_, group_id=group_id):
+            return self._web_error("relation not found", 404)
+        return self._web_ok(memory=self._web_memory_payload(group_id))
+
+    async def web_profile_save(self):
+        data = await self._web_request_json()
+        group_id = str(data.get("group_id") or "").strip()
+        user_id = str(data.get("user_id") or "").strip()
+        profile_id_ = str(data.get("id") or data.get("profile_id") or "").strip()
+        display_name = str(data.get("display_name") or "").strip()
+        group_role = str(data.get("group_role") or "").strip()
+        role_evidence = str(data.get("role_evidence") or "webui").strip()
+        aliases_raw = data.get("aliases", [])
+        if isinstance(aliases_raw, str):
+            aliases = [item.strip() for item in aliases_raw.replace(",", "\n").splitlines() if item.strip()]
+        elif isinstance(aliases_raw, list):
+            aliases = [str(item).strip() for item in aliases_raw if str(item).strip()]
+        else:
+            aliases = []
+        if not group_id:
+            return self._web_error("missing group_id")
+        if profile_id_:
+            profile = self.store.update_profile(
+                profile_id_,
+                group_id,
+                display_name=display_name,
+                aliases=aliases,
+                group_role=group_role,
+                role_evidence=role_evidence,
+            )
+            if not profile:
+                return self._web_error("profile not found", 404)
+        else:
+            if not user_id:
+                return self._web_error("user_id is required")
+            profile = self.store.touch_profile(group_id, user_id, display_name or user_id)
+            self.store.update_profile(
+                profile.id,
+                group_id,
+                display_name=display_name or user_id,
+                aliases=aliases,
+                group_role=group_role or "unknown",
+                role_evidence=role_evidence,
+            )
+        return self._web_ok(memory=self._web_memory_payload(group_id))
+
+    async def web_profile_fact_save(self):
+        data = await self._web_request_json()
+        group_id = str(data.get("group_id") or "").strip()
+        profile_id_ = str(data.get("profile_id") or "").strip()
+        fact = str(data.get("fact") or "").strip()
+        note = str(data.get("note") or "").strip()
+        try:
+            confidence = float(data.get("confidence", 0.8))
+        except (TypeError, ValueError):
+            confidence = 0.8
+        if not group_id or not profile_id_:
+            return self._web_error("missing group_id or profile_id")
+        profile = self.store.profiles.get(profile_id_)
+        if not profile or profile.group_id != group_id:
+            return self._web_error("profile not found", 404)
+        index_raw = data.get("index")
+        if index_raw is None or str(index_raw) == "":
+            if not fact:
+                return self._web_error("fact is required")
+            profile = self.store.remember_profile_fact(
+                group_id=group_id,
+                user_id=profile.user_id,
+                display_name=profile.display_name,
+                fact=fact,
+                note=note,
+                source="webui",
+                confidence=confidence,
+            )
+            self._trim_profile_facts(profile)
+        else:
+            try:
+                index = int(index_raw)
+            except (TypeError, ValueError):
+                return self._web_error("invalid fact index")
+            if not self.store.update_profile_fact(
+                profile_id_,
+                group_id,
+                index,
+                fact=fact,
+                note=note,
+                confidence=confidence,
+            ):
+                return self._web_error("fact not found", 404)
+        return self._web_ok(memory=self._web_memory_payload(group_id))
+
+    async def web_profile_fact_delete(self):
+        data = await self._web_request_json()
+        group_id = str(data.get("group_id") or "").strip()
+        profile_id_ = str(data.get("profile_id") or "").strip()
+        try:
+            index = int(data.get("index"))
+        except (TypeError, ValueError):
+            return self._web_error("invalid fact index")
+        if not group_id or not profile_id_:
+            return self._web_error("missing group_id or profile_id")
+        if not self.store.delete_profile_fact_index(profile_id_, group_id, index):
+            return self._web_error("fact not found", 404)
+        return self._web_ok(memory=self._web_memory_payload(group_id))
+
+    async def web_profile_delete(self):
+        data = await self._web_request_json()
+        group_id = str(data.get("group_id") or "").strip()
+        profile_id_ = str(data.get("profile_id") or data.get("id") or "").strip()
+        if not group_id or not profile_id_:
+            return self._web_error("missing group_id or profile_id")
+        if not self.store.delete_profile(profile_id_, group_id):
+            return self._web_error("profile not found", 404)
+        return self._web_ok(memory=self._web_memory_payload(group_id))
+
     @filter.on_llm_request()
     async def inject_group_relations(self, event: AstrMessageEvent, req: ProviderRequest):
         """在每次 LLM 请求前注入少量当前群关系上下文。"""
+        self._touch_event_scope(event)
         if event.get_extra("group_relation_skip_injection", False):
             return
         if not bool(self.config.get("enable_context_injection", True)):
             return
         query = self._build_injection_query(event, req)
-        top_k = max(0, int(self.config.get("injection_top_k", 5)))
-        if top_k <= 0:
-            return
-        matches = await self._search_relations(event, query, limit=top_k)
-        if not matches:
+        top_k = max(0, self._cfg_int("记忆管理_每轮注入关系数量", "injection_top_k", 5))
+        matches = []
+        if top_k > 0:
+            matches = await self._search_relations(event, query, limit=top_k)
+        if not matches and not self.store.get_profile(self._scope_id(event), _sender_id(event)):
             return
         text = self._build_injection_text(event, matches)
         max_length = int(self.config.get("max_injected_text_length", 1200))
@@ -211,6 +612,7 @@ class GroupRelationsPlugin(Star):
     @filter.on_llm_response()
     async def summarize_dialogue_relations(self, event: AstrMessageEvent, resp: LLMResponse):
         """每隔几轮对话，总结抽取当前会话的人物关系。"""
+        self._touch_event_scope(event)
         if not bool(self.config.get("enable_dialogue_summary", False)):
             return
         if event.get_extra("group_relation_skip_summary", False):
@@ -221,13 +623,14 @@ class GroupRelationsPlugin(Star):
             return
         scope_id = self._scope_id(event)
         buffer = self._summary_buffers.setdefault(scope_id, [])
-        buffer.append({"role": "user", "content": user_text})
+        sender = f"{_sender_name(event)}({_sender_id(event)})"
+        buffer.append({"role": "user", "name": sender, "content": user_text})
         buffer.append({"role": "assistant", "content": assistant_text})
-        trigger_rounds = max(1, int(self.config.get("summary_trigger_rounds", 6)))
+        trigger_rounds = max(1, self._cfg_int("自动总结_触发轮数", "summary_trigger_rounds", 6))
         if len(buffer) < trigger_rounds * 2:
             return
         dialogue = self._format_summary_dialogue(buffer)
-        max_chars = int(self.config.get("summary_max_dialogue_chars", 4000))
+        max_chars = self._cfg_int("自动总结_最大对话长度", "summary_max_dialogue_chars", 4000)
         if max_chars > 0 and len(dialogue) > max_chars:
             dialogue = dialogue[-max_chars:]
         try:
@@ -244,41 +647,75 @@ class GroupRelationsPlugin(Star):
                 chat_provider_id=provider_id,
                 prompt=self._summary_extract_prompt(event, dialogue),
             )
-            relations = self._parse_extracted_relations(summary_resp.completion_text)
+            memories = self._parse_extracted_memories(summary_resp.completion_text)
+            op_limit = max(1, self._cfg_int("记忆管理_每轮记忆更新操作上限", None, 6))
+            memories = memories[:op_limit]
         except Exception as exc:
             logger.warning(f"group relation dialogue summary failed: {exc}")
             return
         finally:
             event.set_extra("group_relation_skip_injection", False)
             event.set_extra("group_relation_skip_summary", False)
-        for item in relations:
-            await self._remember_relation(
-                group_id=scope_id,
-                subject=item["subject"],
-                relation=item["relation"],
-                object_=item["object"],
-                note=item.get("note", ""),
-                source="summary",
-                confidence=float(item.get("confidence", 0.65)),
-            )
+        for item in memories:
+            await self._remember_memory_item(event, item, source="summary", default_confidence=0.65)
         self._summary_buffers[scope_id] = []
 
     @filter.llm_tool(name="group_relation_search")
     async def group_relation_search(self, event: AstrMessageEvent, query: str):
-        """查询当前群的人物关系记忆。
+        """在当前群空间内查询人物关系记忆。
+
+        使用场景：
+        - 用户询问“谁和谁是什么关系”“某人是谁”“某人和我/机器人/群友有什么关联”。
+        - 本轮注入的关系不足以回答，但问题明显依赖群内人际背景。
+        - 需要核对某个人名、昵称、组织、事件或关系类型。
+
+        注意：
+        - 只返回当前群空间的记忆；不要把结果当作其他群的事实。
+        - 没查到就说明记忆不足，不要自行补全。
 
         Args:
-            query(string): 要查询的人名、昵称、关系、事件或自然语言问题。
+            query(string): 人名、昵称、用户ID、关系、事件或自然语言问题。
         """
         if not bool(self.config.get("enable_tool_read", True)):
             yield event.plain_result("群关系记忆查询工具当前未启用。")
             return
+        self._touch_event_scope(event)
         matches = await self._search_relations(event, query)
         if not matches:
             yield event.plain_result(f"没有找到和「{query}」相关的群关系记忆。")
             return
         lines = [format_record(record) for record, _score in matches]
         yield event.plain_result("\n".join(lines))
+
+    @filter.llm_tool(name="group_user_profile_search")
+    async def group_user_profile_search(self, event: AstrMessageEvent, query: str = ""):
+        """在当前群空间内查询用户画像。
+
+        使用场景：
+        - 用户询问某个群友的身份、偏好、别名、常见互动对象或稳定特征。
+        - 回答前需要确认当前发言人或相关人物的画像。
+        - 本轮注入的画像不足，且问题明显依赖群友背景。
+
+        注意：
+        - 用户画像只代表当前群空间内记录到的稳定事实。
+        - 不要把画像事实扩展成未记录的隐私、评价或推测。
+
+        Args:
+            query(string): 用户 ID、昵称、群名片或画像关键词；留空查询当前发言人。
+        """
+        if not bool(self.config.get("enable_tool_read", True)):
+            yield event.plain_result("群用户画像查询工具当前未启用。")
+            return
+        self._touch_event_scope(event)
+        profiles = self.store.find_profiles(
+            self._scope_id(event),
+            query=query or _sender_id(event),
+            limit=self._cfg_int("记忆管理_画像查询返回人数", "max_profile_results", 5),
+        )
+        if not profiles:
+            yield event.plain_result(f"没有找到和「{query}」相关的群用户画像。")
+            return
+        yield event.plain_result("\n".join(format_profile(profile) for profile in profiles))
 
     @filter.llm_tool(name="group_relation_remember")
     async def group_relation_remember(
@@ -290,7 +727,14 @@ class GroupRelationsPlugin(Star):
         note: str = "",
         confidence: float = 0.8,
     ):
-        """写入当前群的一条明确人物关系记忆。
+        """写入当前群空间内一条明确、稳定、可复用的人物关系记忆。
+
+        只有当用户明确表达或明确纠正关系时才调用。适合记录：
+        - A 是 B 的朋友/同学/同事/亲属/管理员/常一起玩的对象。
+        - A 属于某组织、负责某职责、和某群体有稳定关系。
+        - 用户明确纠正了之前的关系事实。
+
+        不要记录玩笑、辱骂、临时情绪、暧昧猜测、敏感隐私或模型推断。
 
         Args:
             subject(string): 关系主体，例如人名、昵称、群成员、组织。
@@ -302,6 +746,7 @@ class GroupRelationsPlugin(Star):
         if not bool(self.config.get("enable_tool_write", False)):
             yield event.plain_result("群关系记忆写入工具当前未启用。")
             return
+        self._touch_event_scope(event)
         confidence = max(0.0, min(1.0, float(confidence)))
         record = await self._remember_relation(
             group_id=self._scope_id(event),
@@ -314,6 +759,48 @@ class GroupRelationsPlugin(Star):
         )
         yield event.plain_result(f"已写入群关系记忆：{format_record(record)}")
 
+    @filter.llm_tool(name="group_user_profile_remember")
+    async def group_user_profile_remember(
+        self,
+        event: AstrMessageEvent,
+        user_id: str,
+        fact: str,
+        display_name: str = "",
+        note: str = "",
+        confidence: float = 0.8,
+    ):
+        """写入当前群空间内某个用户的稳定画像事实。
+
+        只有当用户本人自述、管理员确认、或群聊中明确确认时才调用。适合记录：
+        - 用户ID对应的昵称/群名片、常用别名。
+        - 稳定身份、偏好、长期兴趣、常一起互动的人。
+        - 对之后问答有帮助的非敏感背景。
+
+        不要记录一次性闲聊、攻击性评价、隐私敏感信息、未经确认的猜测。
+
+        Args:
+            user_id(string): 用户 ID；记录当前发言人时传当前发言人 ID。
+            fact(string): 明确、稳定、对之后聊天有帮助的用户画像事实。
+            display_name(string): 用户昵称或群名片，不知道可留空。
+            note(string): 证据摘要，没有可以留空。
+            confidence(number): 可信度，0 到 1 之间。
+        """
+        if not bool(self.config.get("enable_tool_write", False)):
+            yield event.plain_result("群用户画像写入工具当前未启用。")
+            return
+        self._touch_event_scope(event)
+        profile = self.store.remember_profile_fact(
+            group_id=self._scope_id(event),
+            user_id=str(user_id or _sender_id(event)),
+            display_name=display_name or _sender_name(event),
+            fact=fact,
+            note=note,
+            source="tool",
+            confidence=max(0.0, min(1.0, float(confidence))),
+        )
+        self._trim_profile_facts(profile)
+        yield event.plain_result(f"已写入群用户画像：{format_profile(profile)}")
+
     @filter.llm_tool(name="group_relation_update")
     async def group_relation_update(
         self,
@@ -325,7 +812,10 @@ class GroupRelationsPlugin(Star):
         note: str = "",
         confidence: float = -1.0,
     ):
-        """根据用户明确纠正，修改一条当前群关系记忆。
+        """根据用户明确纠正，修改一条当前群空间内的人物关系记忆。
+
+        只有当用户明确指出旧记忆错误或给出更准确说法时才调用。
+        修改前应尽量先通过 group_relation_search 找到 relation_id。
 
         Args:
             relation_id(string): 要修改的关系 ID。
@@ -338,6 +828,7 @@ class GroupRelationsPlugin(Star):
         if not bool(self.config.get("enable_tool_update", False)):
             yield event.plain_result("群关系记忆修改工具当前未启用。")
             return
+        self._touch_event_scope(event)
         old = self.store.records.get(relation_id)
         if not old or old.group_id != self._scope_id(event):
             yield event.plain_result("没有找到这条关系，或它不属于当前群。")
@@ -363,7 +854,10 @@ class GroupRelationsPlugin(Star):
 
     @filter.llm_tool(name="group_relation_delete")
     async def group_relation_delete(self, event: AstrMessageEvent, relation_id: str, reason: str = ""):
-        """根据用户明确纠正，删除一条当前群关系记忆。
+        """根据用户明确纠正，删除一条当前群空间内的人物关系记忆。
+
+        只有当用户明确表示某条关系是错的、过期的或不应记录时才调用。
+        删除前应尽量先通过 group_relation_search 找到 relation_id。
 
         Args:
             relation_id(string): 要删除的关系 ID。
@@ -372,12 +866,14 @@ class GroupRelationsPlugin(Star):
         if not bool(self.config.get("enable_tool_update", False)):
             yield event.plain_result("群关系记忆删除工具当前未启用。")
             return
+        self._touch_event_scope(event)
         ok = self.store.delete(relation_id, group_id=self._scope_id(event))
         yield event.plain_result("已删除。" if ok else "没有找到这条关系，或它不属于当前群。")
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def auto_extract(self, event: AstrMessageEvent):
         """从群聊中自动抽取关系，默认关闭。"""
+        self._touch_event_scope(event)
         if not bool(self.config.get("enable_auto_extract", False)):
             return
         message = event.message_str.strip()
@@ -389,24 +885,18 @@ class GroupRelationsPlugin(Star):
             event.set_extra("group_relation_skip_injection", True)
             response = await self.context.llm_generate(
                 chat_provider_id=provider_id,
-                prompt=self._extract_prompt(message),
+                prompt=self._extract_prompt(event, message),
             )
-            relations = self._parse_extracted_relations(response.completion_text)
+            memories = self._parse_extracted_memories(response.completion_text)
+            op_limit = max(1, self._cfg_int("记忆管理_每轮记忆更新操作上限", None, 6))
+            memories = memories[:op_limit]
         except Exception as exc:
             logger.warning(f"group relation auto extraction failed: {exc}")
             return
         finally:
             event.set_extra("group_relation_skip_injection", False)
-        for item in relations:
-            await self._remember_relation(
-                group_id=self._scope_id(event),
-                subject=item["subject"],
-                relation=item["relation"],
-                object_=item["object"],
-                note=item.get("note", ""),
-                source="auto",
-                confidence=float(item.get("confidence", 0.6)),
-            )
+        for item in memories:
+            await self._remember_memory_item(event, item, source="auto", default_confidence=0.6)
 
     async def _remember_relation(
         self,
@@ -436,6 +926,19 @@ class GroupRelationsPlugin(Star):
     def _debug_denied_message(self) -> str:
         return "这个调试指令会暴露群关系记忆，当前只允许配置里的管理员使用。"
 
+    def _format_profile_query_result(self, event: AstrMessageEvent, query: str = "") -> str:
+        self._touch_event_scope(event)
+        scope_id = self._scope_id(event)
+        query = query.strip() or _sender_id(event)
+        profiles = self.store.find_profiles(
+            scope_id,
+            query=query,
+            limit=self._cfg_int("记忆管理_画像查询返回人数", "max_profile_results", 5),
+        )
+        if not profiles:
+            return f"没有找到「{query}」的群内画像。"
+        return "\n".join(format_profile(profile) for profile in profiles)
+
     def _can_use_debug_commands(self, event: AstrMessageEvent) -> bool:
         if bool(self.config.get("allow_public_debug_commands", False)):
             return True
@@ -454,8 +957,59 @@ class GroupRelationsPlugin(Star):
                 continue
         return False
 
+    def _touch_event_scope(self, event: AstrMessageEvent):
+        scope_id = self._scope_id(event)
+        if event.get_extra("group_relation_scope_touched", False):
+            group = self.store.groups.get(scope_id)
+            if group:
+                return group
+        group_name = _group_name(event)
+        kind = "group" if _is_group_event(event) else "private"
+        existing_profile = self.store.get_profile(scope_id, _sender_id(event))
+        group_role = ""
+        role_evidence = ""
+        should_init_role = (
+            self._cfg_bool("群身份_初始化扫描", None, True)
+            and kind == "group"
+            and (not existing_profile or not existing_profile.group_role or existing_profile.group_role == "unknown")
+        )
+        if should_init_role:
+            group_role, role_evidence = self._resolve_sender_group_role(event)
+        group = self.store.touch_group(
+            group_id=scope_id,
+            name=group_name or self._session_label(event),
+            session_id=event.unified_msg_origin,
+            kind=kind,
+        )
+        self.store.touch_profile(
+            group_id=scope_id,
+            user_id=_sender_id(event),
+            display_name=_sender_name(event),
+            group_role=group_role,
+            role_evidence=role_evidence,
+        )
+        event.set_extra("group_relation_scope_touched", True)
+        return group
+
+    def _resolve_sender_group_role(self, event: AstrMessageEvent) -> tuple[str, str]:
+        for attr_name, role in (
+            ("is_super_admin", "owner"),
+            ("is_group_owner", "owner"),
+            ("is_owner", "owner"),
+            ("is_admin", "admin"),
+            ("is_group_admin", "admin"),
+        ):
+            attr = getattr(event, attr_name, None)
+            try:
+                matched = bool(attr()) if callable(attr) else bool(attr)
+            except Exception:
+                matched = False
+            if matched:
+                return role, f"event.{attr_name}"
+        return "member", "group message initialization"
+
     async def _get_summary_provider_id(self, event: AstrMessageEvent) -> str:
-        provider_id = str(self.config.get("summary_provider_id", "")).strip()
+        provider_id = str(self._cfg("自动总结_模型Provider", "summary_provider_id", "")).strip()
         if provider_id:
             provider = self.context.get_provider_by_id(provider_id)
             if isinstance(provider, Provider):
@@ -492,7 +1046,10 @@ class GroupRelationsPlugin(Star):
     def _format_summary_dialogue(self, buffer: list[dict[str, str]]) -> str:
         lines = []
         for item in buffer:
-            role = "用户" if item["role"] == "user" else "机器人"
+            if item["role"] == "user":
+                role = f"用户 {item.get('name', '').strip()}".strip()
+            else:
+                role = "机器人"
             content = item["content"].strip()
             if content:
                 lines.append(f"{role}: {content}")
@@ -509,22 +1066,55 @@ class GroupRelationsPlugin(Star):
         threshold = float(self.config.get("similarity_threshold", 0.12))
         vector, _provider_id = await self._embed(query)
         if not vector:
-            return self.store.search_by_text(self._scope_id(event), query, limit=limit)
-        return self.store.search_by_vector(
+            matches = self.store.search_by_text(self._scope_id(event), query, limit=limit)
+            return self._cap_speaker_relations(event, matches)
+        matches = self.store.search_by_vector(
             self._scope_id(event),
             query,
             vector,
             limit=limit,
             threshold=threshold,
         )
+        return self._cap_speaker_relations(event, matches)
+
+    def _cap_speaker_relations(
+        self,
+        event: AstrMessageEvent,
+        matches: list[tuple[RelationRecord, float]],
+    ) -> list[tuple[RelationRecord, float]]:
+        cap = self._cfg_int("记忆管理_每人关系召回上限", None, 8)
+        if cap <= 0:
+            return matches
+        speaker_needles = {
+            needle
+            for needle in (_sender_id(event), _sender_name(event))
+            if needle
+        }
+        speaker_related_count = 0
+        capped = []
+        for record, score in matches:
+            text = f"{record.subject} {record.object}"
+            is_speaker_related = any(needle in text for needle in speaker_needles)
+            if is_speaker_related:
+                speaker_related_count += 1
+                if speaker_related_count > cap:
+                    continue
+            capped.append((record, score))
+        return capped
 
     def _scope_id(self, event: AstrMessageEvent) -> str:
-        scope = str(self.config.get("memory_scope", "session")).strip().lower()
+        scope = str(self.config.get("memory_scope", "group")).strip().lower()
         if scope == "global":
             return "global"
         if scope == "group":
             return _group_id(event) or event.unified_msg_origin
         return event.unified_msg_origin
+
+    def _bot_aliases(self) -> list[str]:
+        aliases = _split_config_list(self.config.get("bot_relation_aliases", ""))
+        if not aliases:
+            aliases = {"机器人", "AI", "助手", "本机器人", "AstrBot"}
+        return sorted(aliases)
 
     def _session_label(self, event: AstrMessageEvent) -> str:
         group_name = _group_name(event)
@@ -550,6 +1140,7 @@ class GroupRelationsPlugin(Star):
                 f"群号: {_group_id(event)}" if _group_id(event) else "",
                 f"发言人: {sender_name}",
                 f"发言人ID: {event.get_sender_id()}",
+                f"机器人关系称呼: {', '.join(self._bot_aliases())}",
                 f"消息: {message}",
             ]
             if part
@@ -561,51 +1152,112 @@ class GroupRelationsPlugin(Star):
         matches: list[tuple[RelationRecord, float]],
     ) -> str:
         sender_name = _sender_name(event)
+        sender_id = _sender_id(event)
+        scope_id = self._scope_id(event)
         session_label = self._session_label(event)
+        group = self.store.groups.get(scope_id)
+        profile = self.store.get_profile(scope_id, sender_id)
+        related_profiles = self._find_related_profiles(scope_id, sender_id, matches)
         lines = [
             "<group_relation_context>",
-            "以下是当前群关系记忆的检索结果，仅供本轮回答参考；不要编造未列出的关系。",
+            "以下是当前群空间的临时记忆上下文，仅供本轮回答参考。",
+            "请用这些信息理解当前在哪个群、正在和哪个群友聊天、相关人物是谁，以及他们和当前发言人的关系。",
+            "不要把未列出的关系、身份、偏好或隐私当作事实。",
         ]
         if bool(self.config.get("enable_session_identity_injection", True)):
             lines.extend(
                 [
                     f"当前会话: {session_label}",
-                    f"当前发言人: {sender_name}",
-                    "你正在这个会话里聊天；回答时要把这些关系理解为这个会话内的人际背景。",
+                    f"当前群空间ID: {scope_id}",
+                    f"当前发言人: {sender_name}({sender_id})",
+                    f"机器人在关系记忆中的可能称呼: {', '.join(self._bot_aliases())}",
+                    "回答时优先把当前发言人理解为本轮对话对象，关系和画像都限定在当前群空间内。",
+                ]
+            )
+        if group:
+            lines.extend(
+                [
+                    "",
+                    "群空间状态:",
+                    f"- 类型: {group.kind}",
+                    f"- 已触达消息数: {group.message_count}",
+                    f"- 已记录关系数: {len(self.store.export_group(scope_id))}",
+                    f"- 已记录用户画像数: {len(self.store.export_profiles(scope_id))}",
                 ]
             )
         if bool(self.config.get("enable_person_profile", True)):
-            profile = self._build_person_profile(sender_name, matches)
-            if profile:
-                lines.extend(["", "当前发言人简易画像:", profile])
-        lines.extend(["", "相关关系:"])
-        for record, score in matches:
-            lines.append(f"- {format_record(record)}  score={score:.2f}")
+            profile_text = self._build_person_profile(sender_name, sender_id, profile, matches)
+            if profile_text:
+                lines.extend(["", "当前发言人画像:", profile_text])
+        if related_profiles:
+            lines.extend(["", "相关人物画像:"])
+            lines.extend(f"- {format_profile(item, max_facts=3)}" for item in related_profiles)
+        if matches:
+            lines.extend(["", "相关关系:"])
+            for record, score in matches:
+                lines.append(f"- {format_record(record)}  score={score:.2f}")
         lines.extend(
             [
                 "",
                 "如果用户询问人物关系但以上信息不足，可以主动调用 group_relation_search。",
-                "如果用户明确纠正关系，可在开关允许时调用 group_relation_remember / group_relation_update / group_relation_delete。",
+                "如果用户询问群内某人的画像但以上信息不足，可以主动调用 group_user_profile_search。",
+                "只有当用户明确提供稳定事实或明确纠正时，才在开关允许时写入/修改/删除记忆。",
+                "画像写入使用 group_user_profile_remember；关系写入/修改/删除使用 group_relation_remember / group_relation_update / group_relation_delete。",
                 "</group_relation_context>",
             ]
         )
         return "\n".join(lines)
 
+    def _find_related_profiles(
+        self,
+        scope_id: str,
+        sender_id: str,
+        matches: list[tuple[RelationRecord, float]],
+    ):
+        limit = self._cfg_int("记忆管理_相关人物画像注入人数", "related_profile_max_items", 4)
+        related = []
+        seen = {sender_id}
+        for record, _score in matches:
+            for name in (record.subject, record.object):
+                for profile in self.store.find_profiles(scope_id, query=name, limit=2):
+                    if profile.user_id in seen or profile.id in seen:
+                        continue
+                    related.append(profile)
+                    seen.add(profile.user_id)
+                    seen.add(profile.id)
+                    if len(related) >= limit:
+                        return related
+        return related
+
     def _build_person_profile(
         self,
         person: str,
+        user_id: str,
+        profile,
         matches: list[tuple[RelationRecord, float]],
     ) -> str:
-        limit = int(self.config.get("person_profile_max_items", 4))
+        limit = self._cfg_int("记忆管理_当前发言人画像条数", "person_profile_max_items", 4)
         person_norm = person.strip().lower()
         facts = []
+        if profile:
+            if profile.group_role:
+                facts.append(f"群身份: {profile.group_role}")
+            facts.extend(
+                str(item.get("fact") or "").strip()
+                for item in profile.facts[:limit]
+                if str(item.get("fact") or "").strip()
+            )
+            if profile.aliases:
+                facts.insert(0, f"常用称呼: {', '.join(profile.aliases[:4])}")
         for record, _score in matches:
-            if person_norm and (
-                person_norm in record.subject.lower() or person_norm in record.object.lower()
-            ):
-                facts.append(format_record(record, with_id=False))
             if len(facts) >= limit:
                 break
+            record_subject = record.subject.lower()
+            record_object = record.object.lower()
+            if (person_norm and (
+                person_norm in record.subject.lower() or person_norm in record.object.lower()
+            )) or (user_id and (user_id in record_subject or user_id in record_object)):
+                facts.append(format_record(record, with_id=False))
         return "；".join(facts)
 
     async def _embed(self, text: str) -> tuple[list[float] | None, str]:
@@ -736,45 +1388,124 @@ class GroupRelationsPlugin(Star):
             self.store.vectors[record.id] = normalize_vector(vector)
         self.store.save()
 
-    def _extract_prompt(self, message: str) -> str:
-        return f"""
-从下面这条群聊消息中抽取明确的人物关系。只输出 JSON 数组，不要输出解释。
-每个元素格式：
-{{"subject":"人物A","relation":"关系","object":"人物B","note":"补充信息","confidence":0.0到1.0}}
+    async def _remember_memory_item(
+        self,
+        event: AstrMessageEvent,
+        item: dict,
+        source: str,
+        default_confidence: float,
+    ) -> None:
+        item_type = str(item.get("type") or "relation").strip().lower()
+        confidence = float(item.get("confidence", default_confidence))
+        threshold = self._cfg_float("记忆管理_写入可信度阈值", None, 0.65)
+        if confidence < threshold:
+            return
+        if item_type == "profile":
+            user_id = str(item.get("user_id") or _sender_id(event)).strip()
+            display_name = str(item.get("display_name") or item.get("subject") or _sender_name(event)).strip()
+            fact = str(item.get("fact") or "").strip()
+            if not fact:
+                relation = str(item.get("relation") or "").strip()
+                object_ = str(item.get("object") or "").strip()
+                fact = " ".join(part for part in [relation, object_] if part).strip()
+            if not fact:
+                return
+            profile = self.store.remember_profile_fact(
+                group_id=self._scope_id(event),
+                user_id=user_id,
+                display_name=display_name,
+                fact=fact,
+                note=str(item.get("note") or ""),
+                source=source,
+                confidence=confidence,
+            )
+            self._trim_profile_facts(profile)
+            return
+        await self._remember_relation(
+            group_id=self._scope_id(event),
+            subject=item["subject"],
+            relation=item["relation"],
+            object_=item["object"],
+            note=item.get("note", ""),
+            source=source,
+            confidence=confidence,
+        )
 
-要求：
-1. 只抽取消息明确表达的关系，不要猜测。
-2. 没有明确关系时输出 []。
-3. 人名、昵称、组织名都可以作为 subject 或 object。
+    def _trim_profile_facts(self, profile) -> None:
+        limit = max(1, self._cfg_int("记忆管理_每人记忆上限", None, 20))
+        if len(profile.facts) <= limit:
+            return
+        profile.facts = profile.facts[:limit]
+        self.store.save()
+
+    def _extract_prompt(self, event: AstrMessageEvent, message: str) -> str:
+        return f"""
+你是群关系记忆抽取器。请从单条群聊消息中抽取“明确、稳定、之后聊天有用”的记忆。
+只输出 JSON 数组，不要输出解释、Markdown 或多余文本。
+
+当前群空间：{self._session_label(event)}
+当前发言人：{_sender_name(event)}({_sender_id(event)})
+
+可输出两类元素。
+
+1. 关系记忆：用于描述两个人/组织/群体之间的稳定关系。
+{{"type":"relation","subject":"人物A","relation":"关系","object":"人物B","note":"补充信息","confidence":0.0到1.0}}
+
+2. 用户画像：用于描述某个群友在当前群空间内的稳定身份、别名、偏好或长期特征。
+{{"type":"profile","user_id":"{_sender_id(event)}","display_name":"{_sender_name(event)}","fact":"稳定画像事实","note":"证据摘要","confidence":0.0到1.0}}
+
+抽取规则：
+1. 只能抽取消息字面明确表达、当前发言人自述、或被明确确认的事实。
+2. 对“我/本人/咱”这类指代，若指当前发言人，画像必须使用当前发言人的 user_id 和 display_name。
+3. 关系的 subject/object 可以是人名、昵称、用户ID、组织、群体；画像必须尽量落到具体 user_id。
+4. 不记录一次性闲聊、玩笑、辱骂、情绪评价、敏感隐私、猜测、反问或未确认传闻。
+5. 不能确定时输出 []。
 
 消息：
 {message}
 """.strip()
 
     def _summary_extract_prompt(self, event: AstrMessageEvent, dialogue: str) -> str:
+        personality_prompt = str(self._cfg("自动总结_人格提示词", "summary_personality_prompt", "") or "").strip()
+        personality_block = ""
+        if personality_prompt:
+            personality_block = f"""
+可选人格提示词：
+{personality_prompt}
+
+人格提示词仅用于帮助你理解机器人在群内的称呼、说话风格、角色边界和上下文语气。
+不要把人格提示词本身当作用户事实、人物关系或用户画像写入记忆。
+""".strip()
         return f"""
-你正在为 AstrBot 的当前会话整理人物关系记忆。
+你是 AstrBot 的群关系与用户画像记忆整理器。请从最近几轮对话中抽取“明确、稳定、之后聊天有用”的记忆。
+只输出 JSON 数组，不要输出解释、Markdown 或多余文本。
+
 当前会话：{self._session_label(event)}
-当前发言人：{_sender_name(event)}
+当前最后发言人：{_sender_name(event)}({_sender_id(event)})
 
-请从最近几轮对话中抽取明确、稳定、对之后聊天有帮助的人物关系或人物画像事实。
-只输出 JSON 数组，不要输出解释。
+{personality_block}
 
-每个元素格式：
-{{"subject":"人物A或当前发言人","relation":"关系或画像属性","object":"人物B/群/兴趣/身份/偏好","note":"证据摘要","confidence":0.0到1.0}}
+可输出两类元素。
 
-要求：
-1. 只抽取对话明确表达或强烈确认的事实，不要猜测。
-2. 用户纠正机器人时，以用户纠正为准。
-3. 可以记录人物画像，例如昵称、身份、偏好、常一起玩的对象，但不要记录一次性闲聊废话。
-4. 没有值得记忆的内容时输出 []。
-5. 不要输出隐私敏感、攻击性或不确定的关系。
+1. 关系记忆：描述两个人/组织/群体之间的稳定关系。
+{{"type":"relation","subject":"人物A","relation":"关系","object":"人物B/群/组织","note":"证据摘要","confidence":0.0到1.0}}
+
+2. 用户画像：描述某个群友在当前群空间内的稳定身份、别名、偏好、长期兴趣、常见互动对象或已确认背景。
+{{"type":"profile","user_id":"用户ID","display_name":"昵称或群名片","fact":"稳定画像事实","note":"证据摘要","confidence":0.0到1.0}}
+
+抽取规则：
+1. 只抽取对话明确表达、用户自述、管理员确认或用户纠正后的事实。
+2. 用户纠正机器人时，以用户纠正为准；可以输出新的正确事实，但不要保留被纠正的旧说法。
+3. 对“我/本人/咱/楼上/他”等指代，只有能从对话行里的昵称和ID确定对象时才抽取。
+4. 用户画像必须尽量填写 user_id；无法确定 user_id 时不要输出 profile。
+5. 不记录一次性闲聊、玩笑、攻击性评价、敏感隐私、推测、谣言、未确认关系。
+6. 没有值得记忆的内容时输出 []。
 
 最近对话：
 {dialogue}
 """.strip()
 
-    def _parse_extracted_relations(self, text: str) -> list[dict]:
+    def _parse_extracted_memories(self, text: str) -> list[dict]:
         start = text.find("[")
         end = text.rfind("]")
         if start < 0 or end < start:
@@ -785,22 +1516,43 @@ class GroupRelationsPlugin(Star):
             return []
         if not isinstance(payload, list):
             return []
-        relations = []
+        memories = []
         for item in payload:
             if not isinstance(item, dict):
+                continue
+            item_type = str(item.get("type") or item.get("kind") or "relation").strip().lower()
+            note = str(item.get("note") or "").strip()
+            try:
+                confidence = float(item.get("confidence", 0.65))
+            except (TypeError, ValueError):
+                confidence = 0.65
+            if item_type == "profile":
+                fact = str(item.get("fact") or "").strip()
+                if not fact:
+                    relation = str(item.get("relation") or "").strip()
+                    object_ = str(item.get("object") or "").strip()
+                    fact = " ".join(part for part in [relation, object_] if part).strip()
+                if not fact:
+                    continue
+                memories.append(
+                    {
+                        "type": "profile",
+                        "user_id": str(item.get("user_id") or "").strip()[:80],
+                        "display_name": str(item.get("display_name") or item.get("subject") or "").strip()[:80],
+                        "fact": fact[:160],
+                        "note": note[:240],
+                        "confidence": max(0.0, min(1.0, confidence)),
+                    }
+                )
                 continue
             subject = str(item.get("subject") or "").strip()
             relation = str(item.get("relation") or "").strip()
             object_ = str(item.get("object") or "").strip()
             if not subject or not relation or not object_:
                 continue
-            note = str(item.get("note") or "").strip()
-            try:
-                confidence = float(item.get("confidence", 0.65))
-            except (TypeError, ValueError):
-                confidence = 0.65
-            relations.append(
+            memories.append(
                 {
+                    "type": "relation",
                     "subject": subject[:80],
                     "relation": relation[:80],
                     "object": object_[:80],
@@ -808,7 +1560,7 @@ class GroupRelationsPlugin(Star):
                     "confidence": max(0.0, min(1.0, confidence)),
                 }
             )
-        return relations
+        return memories
 
     async def terminate(self):
         if self._provider_options_task and not self._provider_options_task.done():
