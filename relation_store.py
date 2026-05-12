@@ -40,6 +40,10 @@ class GroupMemorySpace:
     name: str = ""
     session_id: str = ""
     kind: str = "group"
+    owner_user_id: str = ""
+    owner_display_name: str = ""
+    owner_evidence: str = ""
+    owner_updated_at: int = 0
     created_at: int = field(default_factory=lambda: int(time.time()))
     updated_at: int = field(default_factory=lambda: int(time.time()))
     message_count: int = 0
@@ -68,6 +72,10 @@ class UserProfile:
 
 def normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+
+def role_rank(role: str) -> int:
+    return {"unknown": 0, "member": 1, "admin": 2, "owner": 3}.get(normalize_text(role), 0)
 
 
 def profile_id(group_id: str, user_id: str) -> str:
@@ -181,6 +189,7 @@ class RelationStore:
             payload["created_at"] = int(payload.get("created_at") or time.time())
             payload["updated_at"] = int(payload.get("updated_at") or payload["created_at"])
             payload["message_count"] = int(payload.get("message_count") or 0)
+            payload["owner_updated_at"] = int(payload.get("owner_updated_at") or 0)
             return GroupMemorySpace(**payload)
         except (TypeError, ValueError):
             return None
@@ -295,6 +304,9 @@ class RelationStore:
         group_id: str,
         name: str | None = None,
         kind: str | None = None,
+        owner_user_id: str | None = None,
+        owner_display_name: str | None = None,
+        owner_evidence: str | None = None,
     ) -> GroupMemorySpace | None:
         group = self.groups.get(group_id)
         if not group:
@@ -303,6 +315,29 @@ class RelationStore:
             group.name = name.strip()
         if kind is not None and kind.strip():
             group.kind = kind.strip()
+        if owner_user_id is not None:
+            group.owner_user_id = owner_user_id.strip()
+            group.owner_display_name = (owner_display_name or "").strip()
+            group.owner_evidence = (owner_evidence or "webui").strip()
+            group.owner_updated_at = int(time.time()) if group.owner_user_id else 0
+        group.updated_at = int(time.time())
+        self.save()
+        return group
+
+    def set_group_owner(
+        self,
+        group_id: str,
+        user_id: str,
+        display_name: str = "",
+        evidence: str = "",
+    ) -> GroupMemorySpace | None:
+        group = self.groups.get(group_id)
+        if not group:
+            return None
+        group.owner_user_id = user_id.strip()
+        group.owner_display_name = display_name.strip()
+        group.owner_evidence = evidence.strip()
+        group.owner_updated_at = int(time.time()) if group.owner_user_id else 0
         group.updated_at = int(time.time())
         self.save()
         return group
@@ -341,7 +376,7 @@ class RelationStore:
                 if display_name not in profile.aliases:
                     profile.aliases.insert(0, display_name)
                     profile.aliases = profile.aliases[:12]
-            if group_role and (not profile.group_role or profile.group_role == "unknown"):
+            if group_role and role_rank(group_role) > role_rank(profile.group_role):
                 profile.group_role = group_role
                 profile.role_evidence = role_evidence
                 profile.role_updated_at = now
@@ -647,6 +682,110 @@ class RelationStore:
             )
         ]
         return sorted(matches, key=lambda item: item.updated_at, reverse=True)[:limit]
+
+    def find_user_groups(self, user_id: str) -> list[GroupMemorySpace]:
+        user_id = str(user_id or "").strip()
+        if not user_id:
+            return []
+        group_ids = {
+            profile.group_id
+            for profile in self.profiles.values()
+            if profile.user_id == user_id
+        }
+        return sorted(
+            [group for group_id, group in self.groups.items() if group_id in group_ids and group.kind == "group"],
+            key=lambda item: item.updated_at,
+            reverse=True,
+        )
+
+    def sync_private_profile_to_user_groups(self, private_group_id: str, user_id: str) -> list[str]:
+        source = self.get_profile(private_group_id, user_id)
+        if not source:
+            return []
+        synced: list[str] = []
+        for group in self.find_user_groups(user_id):
+            target = self.get_profile(group.id, user_id)
+            if not target:
+                target = self.touch_profile(
+                    group.id,
+                    user_id,
+                    source.display_name or user_id,
+                    source.group_role,
+                    "private sync",
+                )
+            if source.display_name and not target.display_name:
+                target.display_name = source.display_name
+            for alias in source.aliases:
+                if alias and alias not in target.aliases:
+                    target.aliases.append(alias)
+            target.aliases = target.aliases[:12]
+            existing = {normalize_text(str(item.get("fact") or "")) for item in target.facts}
+            changed = False
+            for item in source.facts:
+                norm = normalize_text(str(item.get("fact") or ""))
+                if not norm or norm in existing:
+                    continue
+                copied = dict(item)
+                copied["source"] = f"private_sync:{item.get('source', '')}".rstrip(":")
+                target.facts.insert(0, copied)
+                existing.add(norm)
+                changed = True
+            if changed:
+                target.facts = target.facts[:50]
+                target.updated_at = int(time.time())
+                synced.append(group.id)
+        if synced:
+            self.save()
+        return synced
+
+    def sync_private_relations_to_user_groups(self, private_group_id: str, user_id: str) -> list[str]:
+        source_records = [
+            record
+            for record in self.records.values()
+            if record.group_id == private_group_id
+        ]
+        if not source_records:
+            return []
+        synced: list[str] = []
+        now = int(time.time())
+        for group in self.find_user_groups(user_id):
+            changed = False
+            for source in source_records:
+                target_id = relation_id(group.id, source.subject, source.relation, source.object)
+                target = self.records.get(target_id)
+                if target and target.updated_at >= source.updated_at:
+                    continue
+                source_label = f"private_sync:{source.source}".rstrip(":")
+                if target:
+                    target.note = source.note or target.note
+                    target.source = source_label
+                    target.confidence = max(target.confidence, source.confidence)
+                    target.updated_at = now
+                    target.embedding_provider_id = source.embedding_provider_id
+                    target.embedding_dim = source.embedding_dim
+                else:
+                    target = RelationRecord(
+                        id=target_id,
+                        group_id=group.id,
+                        subject=source.subject,
+                        relation=source.relation,
+                        object=source.object,
+                        note=source.note,
+                        source=source_label,
+                        confidence=source.confidence,
+                        created_at=now,
+                        updated_at=now,
+                        embedding_provider_id=source.embedding_provider_id,
+                        embedding_dim=source.embedding_dim,
+                    )
+                    self.records[target_id] = target
+                self.vectors[target_id] = list(self.vectors.get(source.id) or embed_text(target.text()))
+                changed = True
+            if changed:
+                synced.append(group.id)
+        if synced:
+            self.save()
+        return synced
 
     def export_profiles(self, group_id: str) -> list[dict[str, Any]]:
         return [

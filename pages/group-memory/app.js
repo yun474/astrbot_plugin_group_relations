@@ -119,6 +119,9 @@ function renderGroupForm() {
   const group = state.memory.selected_group;
   $("#groupName").value = group?.name || "";
   $("#groupKind").value = group?.kind || "group";
+  $("#groupOwnerId").value = group?.owner_user_id || "";
+  $("#groupOwnerName").value = group?.owner_display_name || "";
+  $("#groupOwnerEvidence").value = group?.owner_evidence || "";
   $("#groupPanel").hidden = !group;
 }
 
@@ -223,6 +226,9 @@ async function saveGroup() {
     group_id: state.groupId,
     name: $("#groupName").value,
     kind: $("#groupKind").value,
+    owner_user_id: $("#groupOwnerId").value,
+    owner_display_name: $("#groupOwnerName").value,
+    owner_evidence: $("#groupOwnerEvidence").value,
   };
   const result = await apiPost("group-save", body);
   state.memory = result.memory;

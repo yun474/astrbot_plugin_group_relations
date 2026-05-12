@@ -360,6 +360,10 @@ class GroupRelationsPlugin(Star):
             "name": group.name if group else group_id,
             "session_id": group.session_id if group else group_id,
             "kind": group.kind if group else "group",
+            "owner_user_id": group.owner_user_id if group else "",
+            "owner_display_name": group.owner_display_name if group else "",
+            "owner_evidence": group.owner_evidence if group else "",
+            "owner_updated_at": group.owner_updated_at if group else 0,
             "created_at": group.created_at if group else 0,
             "updated_at": group.updated_at if group else 0,
             "message_count": group.message_count if group else 0,
@@ -414,6 +418,9 @@ class GroupRelationsPlugin(Star):
             group_id=group_id,
             name=str(data.get("name", "")),
             kind=str(data.get("kind", "") or "group"),
+            owner_user_id=str(data.get("owner_user_id", "")),
+            owner_display_name=str(data.get("owner_display_name", "")),
+            owner_evidence=str(data.get("owner_evidence", "webui")),
         )
         if not group:
             return self._web_error("group not found", 404)
@@ -658,11 +665,12 @@ class GroupRelationsPlugin(Star):
             event.set_extra("group_relation_skip_summary", False)
         for item in memories:
             await self._remember_memory_item(event, item, source="summary", default_confidence=0.65)
+        self._sync_private_profile_if_needed(event)
         self._summary_buffers[scope_id] = []
 
     @filter.llm_tool(name="group_relation_search")
     async def group_relation_search(self, event: AstrMessageEvent, query: str):
-        """在当前群空间内查询人物关系记忆。
+        """优先在当前群空间查询人物关系记忆；配置允许时会补充同一用户其他群空间的结果。
 
         使用场景：
         - 用户询问“谁和谁是什么关系”“某人是谁”“某人和我/机器人/群友有什么关联”。
@@ -670,7 +678,7 @@ class GroupRelationsPlugin(Star):
         - 需要核对某个人名、昵称、组织、事件或关系类型。
 
         注意：
-        - 只返回当前群空间的记忆；不要把结果当作其他群的事实。
+        - 当前群结果优先；跨群结果会标注来源群，不要把其他群的事实强行当作当前群事实。
         - 没查到就说明记忆不足，不要自行补全。
 
         Args:
@@ -684,12 +692,12 @@ class GroupRelationsPlugin(Star):
         if not matches:
             yield event.plain_result(f"没有找到和「{query}」相关的群关系记忆。")
             return
-        lines = [format_record(record) for record, _score in matches]
+        lines = [self._format_tool_record(event, record) for record, _score in matches]
         yield event.plain_result("\n".join(lines))
 
     @filter.llm_tool(name="group_user_profile_search")
     async def group_user_profile_search(self, event: AstrMessageEvent, query: str = ""):
-        """在当前群空间内查询用户画像。
+        """优先在当前群空间查询用户画像；配置允许时会补充同一用户其他群空间的结果。
 
         使用场景：
         - 用户询问某个群友的身份、偏好、别名、常见互动对象或稳定特征。
@@ -697,7 +705,7 @@ class GroupRelationsPlugin(Star):
         - 本轮注入的画像不足，且问题明显依赖群友背景。
 
         注意：
-        - 用户画像只代表当前群空间内记录到的稳定事实。
+        - 当前群结果优先；跨群结果会标注来源群，不要把其他群的事实强行当作当前群事实。
         - 不要把画像事实扩展成未记录的隐私、评价或推测。
 
         Args:
@@ -707,15 +715,23 @@ class GroupRelationsPlugin(Star):
             yield event.plain_result("群用户画像查询工具当前未启用。")
             return
         self._touch_event_scope(event)
+        allow_cross_group = self._cfg_bool("记忆隔离_允许跨群召回", None, True)
         profiles = self.store.find_profiles(
             self._scope_id(event),
             query=query or _sender_id(event),
             limit=self._cfg_int("记忆管理_画像查询返回人数", "max_profile_results", 5),
         )
+        if allow_cross_group:
+            profiles = self._cross_group_profiles(
+                _sender_id(event),
+                query or _sender_id(event),
+                profiles,
+                self._scope_id(event),
+            )
         if not profiles:
             yield event.plain_result(f"没有找到和「{query}」相关的群用户画像。")
             return
-        yield event.plain_result("\n".join(format_profile(profile) for profile in profiles))
+        yield event.plain_result("\n".join(self._format_tool_profile(event, profile) for profile in profiles))
 
     @filter.llm_tool(name="group_relation_remember")
     async def group_relation_remember(
@@ -757,6 +773,7 @@ class GroupRelationsPlugin(Star):
             source="tool",
             confidence=confidence,
         )
+        self._sync_private_profile_if_needed(event)
         yield event.plain_result(f"已写入群关系记忆：{format_record(record)}")
 
     @filter.llm_tool(name="group_user_profile_remember")
@@ -799,6 +816,7 @@ class GroupRelationsPlugin(Star):
             confidence=max(0.0, min(1.0, float(confidence))),
         )
         self._trim_profile_facts(profile)
+        self._sync_private_profile_if_needed(event)
         yield event.plain_result(f"已写入群用户画像：{format_profile(profile)}")
 
     @filter.llm_tool(name="group_relation_update")
@@ -897,6 +915,7 @@ class GroupRelationsPlugin(Star):
             event.set_extra("group_relation_skip_injection", False)
         for item in memories:
             await self._remember_memory_item(event, item, source="auto", default_confidence=0.6)
+        self._sync_private_profile_if_needed(event)
 
     async def _remember_relation(
         self,
@@ -988,6 +1007,13 @@ class GroupRelationsPlugin(Star):
             group_role=group_role,
             role_evidence=role_evidence,
         )
+        if group_role == "owner" and not group.owner_user_id:
+            self.store.set_group_owner(
+                scope_id,
+                _sender_id(event),
+                _sender_name(event),
+                role_evidence or "group role initialization",
+            )
         event.set_extra("group_relation_scope_touched", True)
         return group
 
@@ -1007,6 +1033,26 @@ class GroupRelationsPlugin(Star):
             if matched:
                 return role, f"event.{attr_name}"
         return "member", "group message initialization"
+
+    def _sync_private_profile_if_needed(self, event: AstrMessageEvent) -> None:
+        if _is_group_event(event):
+            return
+        if not self._cfg_bool("私聊_同步到所属群空间", None, True):
+            return
+        profile_synced = self.store.sync_private_profile_to_user_groups(
+            self._scope_id(event),
+            _sender_id(event),
+        )
+        relation_synced = self.store.sync_private_relations_to_user_groups(
+            self._scope_id(event),
+            _sender_id(event),
+        )
+        synced = sorted(set(profile_synced + relation_synced))
+        if synced:
+            logger.info(
+                f"group relation synced private memory for user `{_sender_id(event)}` "
+                f"to groups: {', '.join(synced)}"
+            )
 
     async def _get_summary_provider_id(self, event: AstrMessageEvent) -> str:
         provider_id = str(self._cfg("自动总结_模型Provider", "summary_provider_id", "")).strip()
@@ -1067,7 +1113,7 @@ class GroupRelationsPlugin(Star):
         vector, _provider_id = await self._embed(query)
         if not vector:
             matches = self.store.search_by_text(self._scope_id(event), query, limit=limit)
-            return self._cap_speaker_relations(event, matches)
+            return self._cross_group_relation_fallback(event, query, self._cap_speaker_relations(event, matches), limit)
         matches = self.store.search_by_vector(
             self._scope_id(event),
             query,
@@ -1075,7 +1121,66 @@ class GroupRelationsPlugin(Star):
             limit=limit,
             threshold=threshold,
         )
-        return self._cap_speaker_relations(event, matches)
+        return self._cross_group_relation_fallback(event, query, self._cap_speaker_relations(event, matches), limit)
+
+    def _cross_group_relation_fallback(
+        self,
+        event: AstrMessageEvent,
+        query: str,
+        matches: list[tuple[RelationRecord, float]],
+        limit: int,
+    ) -> list[tuple[RelationRecord, float]]:
+        if not self._cfg_bool("记忆隔离_允许跨群召回", None, True):
+            return matches
+        if len(matches) >= limit:
+            return matches[:limit]
+        seen = {record.id for record, _score in matches}
+        merged = list(matches)
+        for group in self.store.find_user_groups(_sender_id(event)):
+            if group.id == self._scope_id(event):
+                continue
+            for record, score in self.store.search_by_text(group.id, query, limit=limit):
+                if record.id in seen:
+                    continue
+                seen.add(record.id)
+                merged.append((record, score))
+                if len(merged) >= limit:
+                    return merged[:limit]
+        return merged
+
+    def _cross_group_profiles(self, user_id: str, query: str, profiles=None, current_group_id: str = ""):
+        limit = self._cfg_int("记忆管理_画像查询返回人数", "max_profile_results", 5)
+        merged = list(profiles or [])
+        if len(merged) >= limit:
+            return merged[:limit]
+        seen = {profile.id for profile in merged}
+        for group in self.store.find_user_groups(user_id):
+            if current_group_id and group.id == current_group_id:
+                continue
+            for profile in self.store.find_profiles(group.id, query=query, limit=limit):
+                if profile.id in seen:
+                    continue
+                seen.add(profile.id)
+                merged.append(profile)
+                if len(merged) >= limit:
+                    return merged[:limit]
+        return merged
+
+    def _group_label_for_memory(self, group_id: str) -> str:
+        group = self.store.groups.get(group_id)
+        return group.name or group_id if group else group_id
+
+    def _format_tool_record(self, event: AstrMessageEvent, record: RelationRecord) -> str:
+        text = format_record(record)
+        if record.group_id != self._scope_id(event):
+            return f"[来自群:{self._group_label_for_memory(record.group_id)}] {text}"
+        return text
+
+    def _format_tool_profile(self, event: AstrMessageEvent, profile) -> str:
+        text = format_profile(profile)
+        if profile.group_id != self._scope_id(event):
+            return f"[来自群:{self._group_label_for_memory(profile.group_id)}] {text}"
+        return text
 
     def _cap_speaker_relations(
         self,
@@ -1175,11 +1280,14 @@ class GroupRelationsPlugin(Star):
                 ]
             )
         if group:
+            owner = group.owner_display_name or group.owner_user_id or "未知"
             lines.extend(
                 [
                     "",
                     "群空间状态:",
                     f"- 类型: {group.kind}",
+                    f"- 群主: {owner}",
+                    f"- 群主来源: {group.owner_evidence or '未记录'}",
                     f"- 已触达消息数: {group.message_count}",
                     f"- 已记录关系数: {len(self.store.export_group(scope_id))}",
                     f"- 已记录用户画像数: {len(self.store.export_profiles(scope_id))}",
