@@ -160,7 +160,7 @@ class GroupRelationsPlugin(Star):
                     f"Embedding Provider：{provider.meta().id if provider else '不可用'}",
                     f"向量本地回退：{bool(self.config.get('enable_local_embedding_fallback', False))}",
                     f"总结 Provider：{self._cfg('自动总结_模型Provider', 'summary_provider_id', '') or '当前会话模型'}",
-                    f"总结人格提示词：{'已配置' if str(self._cfg('自动总结_人格提示词', 'summary_personality_prompt', '')).strip() else '未配置'}",
+                    f"总结参考人格：{self._summary_persona_label()}",
                     f"已记录群空间：{len(self.store.groups)}",
                     f"当前群关系数：{len(self.store.export_group(scope_id))}",
                     f"当前群用户画像数：{len(self.store.export_profiles(scope_id))}",
@@ -1208,6 +1208,29 @@ class GroupRelationsPlugin(Star):
         )
         return "\n".join(lines)
 
+    def _summary_persona_label(self) -> str:
+        persona_id = str(self.config.get("自动总结_人格选择", "") or "").strip()
+        return persona_id or "未选择"
+
+    def _summary_persona_prompt(self) -> str:
+        persona_id = str(self.config.get("自动总结_人格选择", "") or "").strip()
+        if not persona_id:
+            return ""
+        persona_manager = getattr(self.context, "persona_manager", None)
+        get_persona = getattr(persona_manager, "get_persona", None)
+        if not callable(get_persona):
+            logger.warning("group relation summary persona skipped: persona_manager is unavailable.")
+            return ""
+        try:
+            persona = get_persona(persona_id)
+        except Exception as exc:
+            logger.warning(f"group relation summary persona `{persona_id}` cannot be loaded: {exc}")
+            return ""
+        system_prompt = str(getattr(persona, "system_prompt", "") or "").strip()
+        if not system_prompt:
+            logger.warning(f"group relation summary persona `{persona_id}` has empty system_prompt.")
+        return system_prompt
+
     def _find_related_profiles(
         self,
         scope_id: str,
@@ -1466,15 +1489,15 @@ class GroupRelationsPlugin(Star):
 """.strip()
 
     def _summary_extract_prompt(self, event: AstrMessageEvent, dialogue: str) -> str:
-        personality_prompt = str(self._cfg("自动总结_人格提示词", "summary_personality_prompt", "") or "").strip()
+        personality_prompt = self._summary_persona_prompt()
         personality_block = ""
         if personality_prompt:
             personality_block = f"""
-可选人格提示词：
+已选择的 AstrBot 人格 system_prompt：
 {personality_prompt}
 
-人格提示词仅用于帮助你理解机器人在群内的称呼、说话风格、角色边界和上下文语气。
-不要把人格提示词本身当作用户事实、人物关系或用户画像写入记忆。
+该人格来自 AstrBot 已配置人格，仅用于帮助你理解机器人在群内的称呼、说话风格、角色边界和上下文语气。
+不要把人格内容本身当作用户事实、人物关系或用户画像写入记忆。
 """.strip()
         return f"""
 你是 AstrBot 的群关系与用户画像记忆整理器。请从最近几轮对话中抽取“明确、稳定、之后聊天有用”的记忆。
