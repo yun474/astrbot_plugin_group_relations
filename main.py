@@ -17,6 +17,7 @@ from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 from .relation_store import (
     RelationRecord,
     RelationStore,
+    format_basic_profile,
     format_profile,
     format_record,
 )
@@ -28,7 +29,7 @@ PLUGIN_NAME = "astrbot_plugin_group_relations"
 def _group_id(event: AstrMessageEvent) -> str:
     message_obj = getattr(event, "message_obj", None)
     group_id = getattr(message_obj, "group_id", "") if message_obj else ""
-    return str(group_id or getattr(message_obj, "session_id", "") or event.unified_msg_origin)
+    return str(group_id or "")
 
 
 def _group_name(event: AstrMessageEvent) -> str:
@@ -63,7 +64,7 @@ def normalize_role(value) -> str:
         return "owner"
     if role in {"admin", "administrator", "管理员", "manage", "manager"}:
         return "admin"
-    if role in {"member", "群友", "成员", "user", "normal"}:
+    if role in {"member", "manber", "群友", "成员", "user", "normal"}:
         return "member"
     return role
 
@@ -127,6 +128,7 @@ class GroupRelationsPlugin(Star):
                     "/关系 画像 [用户ID或昵称]",
                     "/关系 删除画像 <用户ID或昵称> [画像关键词]",
                     "/关系 刷新目录",
+                    "/关系 更新成员列表",
                     "/关系 调试 <查询词>",
                     "/关系 最近",
                 ]
@@ -152,7 +154,7 @@ class GroupRelationsPlugin(Star):
                     f"工具读取：{bool(self.config.get('enable_tool_read', True))}",
                     f"工具写入：{bool(self.config.get('enable_tool_write', False))}",
                     f"工具修改/删除：{bool(self.config.get('enable_tool_update', False))}",
-                    f"记忆隔离：{self.config.get('memory_scope', 'group')}",
+                    "记忆隔离：群聊按群空间隔离，私聊按会话独立",
                     "召回方式：user_id 优先 + 文本匹配",
                     f"总结 Provider：{self._cfg('自动总结_模型Provider', 'summary_provider_id', '') or '当前会话模型'}",
                     f"总结参考人格：{self._summary_persona_label()}",
@@ -206,6 +208,30 @@ class GroupRelationsPlugin(Star):
                     f"成员数：{group.member_count}",
                     f"来源：{group.member_directory_source or '未知'}",
                     f"群主：{group.owner_display_name or group.owner_user_id or '未知'}",
+                ]
+            )
+        )
+
+    @relations.command("更新成员列表")
+    async def update_member_list(self, event: AstrMessageEvent):
+        """管理员手动更新当前群成员列表。"""
+        if not self._can_use_debug_commands(event):
+            yield event.plain_result(self._debug_denied_message())
+            return
+        if not _is_group_event(event):
+            yield event.plain_result("当前不是群聊，不能更新群成员列表。")
+            return
+        group = self._touch_event_scope(event)
+        await self._refresh_group_directory(event, force=True)
+        group = self.store.groups.get(group.id) or group
+        yield event.plain_result(
+            "\n".join(
+                [
+                    f"群成员列表已更新：{group.name or group.id}",
+                    f"成员数：{group.member_count}",
+                    f"来源：{group.member_directory_source or '未知'}",
+                    f"群主：{group.owner_display_name or group.owner_user_id or '未知'}",
+                    "WebUI 中手动修正过的成员身份不会被本次平台刷新覆盖。",
                 ]
             )
         )
@@ -312,9 +338,12 @@ class GroupRelationsPlugin(Star):
         routes = [
             ("memory", self.web_memory, ["GET"], "Group relation memory overview"),
             ("group-save", self.web_group_save, ["POST"], "Update group memory space"),
+            ("member-save", self.web_member_save, ["POST"], "Update group member role"),
             ("relation-save", self.web_relation_save, ["POST"], "Create or update group relation"),
             ("relation-delete", self.web_relation_delete, ["POST"], "Delete group relation"),
             ("profile-save", self.web_profile_save, ["POST"], "Create or update group user profile"),
+            ("profile-basic-save", self.web_profile_basic_save, ["POST"], "Create or update stable group user profile field"),
+            ("profile-basic-delete", self.web_profile_basic_delete, ["POST"], "Delete stable group user profile field"),
             ("profile-fact-save", self.web_profile_fact_save, ["POST"], "Create or update group user profile fact"),
             ("profile-fact-delete", self.web_profile_fact_delete, ["POST"], "Delete group user profile fact"),
             ("profile-delete", self.web_profile_delete, ["POST"], "Delete group user profile"),
@@ -511,12 +540,27 @@ class GroupRelationsPlugin(Star):
             return False
         return self.store.has_member(group_id, user_id)
 
+    async def web_member_save(self):
+        data = await self._web_request_json()
+        group_id = str(data.get("group_id") or "").strip()
+        user_id = str(data.get("user_id") or "").strip()
+        role = normalize_role(data.get("role") or "member")
+        if not group_id or not user_id:
+            return self._web_error("missing group_id or user_id")
+        if role not in {"owner", "admin", "member"}:
+            return self._web_error("role must be owner, admin or member")
+        member = self._apply_member_role_override(group_id, user_id, role, "webui")
+        if not member:
+            return self._web_error("member not found", 404)
+        return self._web_ok(memory=self._web_memory_payload(group_id))
+
     async def web_profile_save(self):
         data = await self._web_request_json()
         group_id = str(data.get("group_id") or "").strip()
         user_id = str(data.get("user_id") or "").strip()
         profile_id_ = str(data.get("id") or data.get("profile_id") or "").strip()
         display_name = str(data.get("display_name") or "").strip()
+        preferred_name = str(data.get("preferred_name") or "").strip()
         group_role = str(data.get("group_role") or "").strip()
         role_evidence = str(data.get("role_evidence") or "webui").strip()
         aliases_raw = data.get("aliases", [])
@@ -533,6 +577,7 @@ class GroupRelationsPlugin(Star):
                 profile_id_,
                 group_id,
                 display_name=display_name,
+                preferred_name=preferred_name,
                 aliases=aliases,
                 group_role=group_role,
                 role_evidence=role_evidence,
@@ -549,10 +594,63 @@ class GroupRelationsPlugin(Star):
                 profile.id,
                 group_id,
                 display_name=display_name or user_id,
+                preferred_name=preferred_name,
                 aliases=aliases,
                 group_role=group_role or "unknown",
                 role_evidence=role_evidence,
             )
+        return self._web_ok(memory=self._web_memory_payload(group_id))
+
+    async def web_profile_basic_save(self):
+        data = await self._web_request_json()
+        group_id = str(data.get("group_id") or "").strip()
+        profile_id_ = str(data.get("profile_id") or "").strip()
+        field = str(data.get("field") or "").strip()
+        key = str(data.get("key") or "").strip()
+        value = str(data.get("value") or "").strip()
+        note = str(data.get("note") or "").strip()
+        try:
+            confidence = float(data.get("confidence", 0.8))
+        except (TypeError, ValueError):
+            confidence = 0.8
+        try:
+            importance = float(data.get("importance", 0.8))
+        except (TypeError, ValueError):
+            importance = 0.8
+        if not group_id or not profile_id_:
+            return self._web_error("missing group_id or profile_id")
+        profile = self.store.profiles.get(profile_id_)
+        if not profile or profile.group_id != group_id:
+            return self._web_error("profile not found", 404)
+        if not field or not value:
+            return self._web_error("field and value are required")
+        updated = self.store.upsert_profile_basic(
+            group_id=group_id,
+            user_id=profile.user_id,
+            display_name=profile.display_name,
+            field=field,
+            key=key,
+            value=value,
+            note=note,
+            source="webui",
+            confidence=confidence,
+            importance=importance,
+        )
+        if not updated:
+            return self._web_error("unsupported basic profile field")
+        return self._web_ok(memory=self._web_memory_payload(group_id))
+
+    async def web_profile_basic_delete(self):
+        data = await self._web_request_json()
+        group_id = str(data.get("group_id") or "").strip()
+        profile_id_ = str(data.get("profile_id") or "").strip()
+        field = str(data.get("field") or "").strip()
+        key = str(data.get("key") or "").strip()
+        value = str(data.get("value") or "").strip()
+        if not group_id or not profile_id_:
+            return self._web_error("missing group_id or profile_id")
+        if not self.store.delete_profile_basic(profile_id_, group_id, field, value=value, key=key):
+            return self._web_error("basic profile item not found", 404)
         return self._web_ok(memory=self._web_memory_payload(group_id))
 
     async def web_profile_fact_save(self):
@@ -874,6 +972,82 @@ class GroupRelationsPlugin(Star):
         self._sync_private_profile_if_needed(event)
         yield event.plain_result(f"已写入群用户画像上下文：{format_profile(profile)}")
 
+    @filter.llm_tool(name="group_user_basic_profile_update")
+    async def group_user_basic_profile_update(
+        self,
+        event: AstrMessageEvent,
+        user_id: str,
+        operation: str,
+        field: str,
+        value: str = "",
+        key: str = "",
+        old_value: str = "",
+        display_name: str = "",
+        note: str = "",
+        confidence: float = 0.8,
+        importance: float = 0.8,
+    ):
+        """按用户明确说法增删改稳定基础画像字段。
+
+        适合记录和维护昵称、希望被如何称呼、爱好、讨厌的东西、稳定特征和长期备注。
+        删除或替换必须来自用户明确否定、纠正或要求不要再这样称呼/记录。
+
+        Args:
+            user_id(string): 目标用户 ID；记录当前发言人时传当前发言人 ID。
+            operation(string): upsert / delete / replace。
+            field(string): preferred_name / aliases / likes / dislikes / traits / notes。
+            value(string): 新值；delete 时是要删除的值。
+            key(string): 可选分类键，如 game / food / nickname。
+            old_value(string): replace 时要删除的旧值。
+            display_name(string): 目标用户昵称或群名片。
+            note(string): 用户原话或证据摘要。
+            confidence(number): 可信度，0 到 1。
+            importance(number): 长期重要度，0 到 1。
+        """
+        operation = str(operation or "upsert").strip().lower()
+        if operation in {"delete", "remove"}:
+            if not bool(self.config.get("enable_tool_update", False)):
+                yield event.plain_result("群用户基础画像删除工具当前未启用。")
+                return
+        elif not bool(self.config.get("enable_tool_write", False)):
+            yield event.plain_result("群用户基础画像写入工具当前未启用。")
+            return
+        self._touch_event_scope(event)
+        target_user_id = str(user_id or _sender_id(event)).strip()
+        ok, reason = await self._validate_group_user_for_write(event, target_user_id, display_name or _sender_name(event))
+        if not ok:
+            yield event.plain_result(reason)
+            return
+        profile = self.store.get_profile(self._scope_id(event), target_user_id)
+        if operation in {"delete", "remove", "replace"}:
+            if not profile:
+                yield event.plain_result("没有找到这个用户的画像，无法删除基础字段。")
+                return
+            delete_value = old_value if operation == "replace" and old_value else value
+            if delete_value:
+                self.store.delete_profile_basic(profile.id, self._scope_id(event), field, value=delete_value, key=key)
+        if operation not in {"delete", "remove"}:
+            if not value:
+                yield event.plain_result("缺少基础画像新值。")
+                return
+            profile = self.store.upsert_profile_basic(
+                group_id=self._scope_id(event),
+                user_id=target_user_id,
+                display_name=display_name or _sender_name(event),
+                field=field,
+                key=key,
+                value=value,
+                note=note,
+                source="tool",
+                confidence=max(0.0, min(1.0, float(confidence))),
+                importance=max(0.0, min(1.0, float(importance))),
+            )
+        self._sync_private_profile_if_needed(event)
+        profile = profile or self.store.get_profile(self._scope_id(event), target_user_id)
+        yield event.plain_result(
+            f"已更新基础画像：{format_basic_profile(profile)}" if profile else "基础画像已更新。"
+        )
+
     @filter.llm_tool(name="group_relation_update")
     async def group_relation_update(
         self,
@@ -1016,6 +1190,31 @@ class GroupRelationsPlugin(Star):
 
     def _debug_denied_message(self) -> str:
         return "这个调试指令会暴露群关系记忆，当前只允许配置里的管理员使用。"
+
+    def _apply_member_role_override(self, group_id: str, user_id: str, role: str, source: str):
+        role = normalize_role(role)
+        if role not in {"owner", "admin", "member"}:
+            return None
+        member = self.store.update_group_member_role(group_id, user_id, role, source=source)
+        if not member:
+            return None
+        evidence = f"{source} member role override"
+        profile = self.store.get_profile(group_id, user_id)
+        if not profile:
+            profile = self.store.touch_profile(group_id, user_id, member.display_name or user_id, role, evidence)
+        self.store.update_profile(
+            profile.id,
+            group_id,
+            display_name=profile.display_name or member.display_name or user_id,
+            group_role=role,
+            role_evidence=evidence,
+        )
+        group = self.store.groups.get(group_id)
+        if role == "owner":
+            self.store.set_group_owner(group_id, user_id, member.display_name or user_id, evidence)
+        elif group and group.owner_user_id == user_id:
+            self.store.set_group_owner(group_id, "", "", evidence)
+        return member
 
     def _is_low_value_text(self, text: str) -> bool:
         text = str(text or "").strip()
@@ -1512,10 +1711,14 @@ class GroupRelationsPlugin(Star):
                     f"- 显示名: {profile.display_name or user_id}",
                     f"- 群身份: {profile.group_role or 'unknown'}",
                     f"- 身份来源: {profile.role_evidence or '未记录'}",
+                    f"- 首选称呼: {profile.preferred_name or '未记录'}",
                     f"- 别名: {', '.join(profile.aliases) if profile.aliases else '无'}",
                     f"- 触达次数: {profile.message_count}",
                 ]
             )
+            basic_text = format_basic_profile(profile, max_items=6)
+            if basic_text:
+                lines.append(f"- 基础画像: {basic_text}")
             if profile.facts:
                 lines.append("- 画像事实:")
                 for item in profile.facts[: self._cfg_int("记忆管理_当前发言人画像条数", "person_profile_max_items", 4)]:
@@ -1593,10 +1796,7 @@ class GroupRelationsPlugin(Star):
         return capped
 
     def _scope_id(self, event: AstrMessageEvent) -> str:
-        scope = str(self.config.get("memory_scope", "group")).strip().lower()
-        if scope == "global":
-            return "global"
-        if scope == "group":
+        if _is_group_event(event):
             return _group_id(event) or event.unified_msg_origin
         return event.unified_msg_origin
 
@@ -1609,7 +1809,7 @@ class GroupRelationsPlugin(Star):
     def _session_label(self, event: AstrMessageEvent) -> str:
         group_name = _group_name(event)
         group_id = _group_id(event)
-        if group_id:
+        if _is_group_event(event):
             if group_name:
                 return f"群聊「{group_name}」({group_id})"
             return f"群聊({group_id})"
@@ -1695,7 +1895,7 @@ class GroupRelationsPlugin(Star):
                 "",
                 "如果用户询问群友身份、画像或人物关系但以上信息不足，可以主动调用 group_user_context_lookup；知道用户ID时必须传 user_id。",
                 "只有当用户明确提供稳定环境事实、人物关系或明确纠正时，才在开关允许时写入/修改/删除。",
-                "画像写入使用 group_user_profile_save；关系写入/修改/删除使用 group_relation_save / group_relation_update / group_relation_delete。",
+                "昵称、爱好、讨厌的东西和稳定特征优先使用 group_user_basic_profile_update；普通画像事实使用 group_user_profile_save；关系写入/修改/删除使用 group_relation_save / group_relation_update / group_relation_delete。",
                 "</group_relation_context>",
             ]
         )
@@ -1758,11 +1958,16 @@ class GroupRelationsPlugin(Star):
         if profile:
             if profile.group_role:
                 facts.append(f"群身份: {profile.group_role}")
+            basic_text = format_basic_profile(profile, max_items=4)
+            if basic_text:
+                facts.append(basic_text)
             facts.extend(
                 str(item.get("fact") or "").strip()
                 for item in profile.facts[:limit]
                 if str(item.get("fact") or "").strip()
             )
+            if profile.preferred_name:
+                facts.insert(0, f"首选称呼: {profile.preferred_name}")
             if profile.aliases:
                 facts.insert(0, f"常用称呼: {', '.join(profile.aliases[:4])}")
         for record, _score in matches:
@@ -1795,6 +2000,42 @@ class GroupRelationsPlugin(Star):
         importance = float(item.get("importance", 0.6))
         threshold = self._cfg_float("记忆管理_写入可信度阈值", None, 0.65)
         if confidence < threshold:
+            return
+        if item_type in {"profile_basic", "basic_profile", "profile_field"}:
+            user_id = str(item.get("user_id") or _sender_id(event)).strip()
+            display_name = str(item.get("display_name") or item.get("subject") or _sender_name(event)).strip()
+            field = str(item.get("field") or "").strip()
+            value = str(item.get("value") or "").strip()
+            old_value = str(item.get("old_value") or "").strip()
+            key = str(item.get("key") or "").strip()
+            operation = str(item.get("operation") or "upsert").strip().lower()
+            if not field:
+                return
+            ok, reason = await self._validate_group_user_for_write(event, user_id, display_name)
+            if not ok:
+                logger.info(f"group relation skipped basic profile memory: {reason}")
+                return
+            profile = self.store.get_profile(self._scope_id(event), user_id)
+            if operation in {"delete", "remove", "replace"} and profile:
+                delete_value = old_value if operation == "replace" and old_value else value
+                if delete_value:
+                    self.store.delete_profile_basic(profile.id, self._scope_id(event), field, value=delete_value, key=key)
+            if operation in {"delete", "remove"}:
+                return
+            if not value:
+                return
+            self.store.upsert_profile_basic(
+                group_id=self._scope_id(event),
+                user_id=user_id,
+                display_name=display_name,
+                field=field,
+                key=key,
+                value=value,
+                note=str(item.get("note") or ""),
+                source=source,
+                confidence=confidence,
+                importance=importance,
+            )
             return
         if item_type == "profile":
             user_id = str(item.get("user_id") or _sender_id(event)).strip()
@@ -1881,22 +2122,27 @@ class GroupRelationsPlugin(Star):
 当前群空间：{self._session_label(event)}
 当前发言人：{_sender_name(event)}({_sender_id(event)})
 
-可输出两类元素。
+可输出三类元素。
 
 1. 关系记忆：用于描述群成员之间的稳定关系，至少要有一个群成员 user_id。
 {{"type":"relation","subject":"人物A","subject_user_id":"群成员A的ID或空","relation":"关系","object":"人物B","object_user_id":"群成员B的ID或空","category":"relationship/role/preference/memory/correction","note":"证据摘要","confidence":0.0到1.0,"importance":0.0到1.0}}
 
-2. 用户画像：用于描述某个群友在当前群空间内的稳定身份、别名、偏好或长期特征。
+2. 基础画像：用于维护昵称/首选称呼/爱好/讨厌的东西/稳定特征/长期备注。优先使用此类型，不要把这些内容写成普通画像事实。
+{{"type":"profile_basic","operation":"upsert/delete/replace","user_id":"{_sender_id(event)}","display_name":"{_sender_name(event)}","field":"preferred_name/aliases/likes/dislikes/traits/notes","key":"可选分类键，如 game/food/nickname","value":"新值或要删除的值","old_value":"replace 时的旧值或空","note":"证据摘要","confidence":0.0到1.0,"importance":0.0到1.0}}
+
+3. 普通用户画像：只用于不适合归入基础画像、但长期有用的稳定事实。
 {{"type":"profile","user_id":"{_sender_id(event)}","display_name":"{_sender_name(event)}","category":"identity/preference/impression/memory/correction","fact":"稳定画像事实","note":"证据摘要","confidence":0.0到1.0,"importance":0.0到1.0}}
 
 抽取规则：
 1. 只能抽取消息字面明确表达、当前发言人自述、或被明确确认的事实。
 2. 对“我/本人/咱”这类指代，若指当前发言人，画像必须使用当前发言人的 user_id 和 display_name。
 3. 关系若涉及当前发言人，必须填写当前发言人的 user_id；不能确定群成员 ID 时不要输出该关系。
-4. 只保留长期有用信息：群身份、稳定关系、明确偏好、长期习惯、用户要求记住的内容、纠错后的事实。
-5. 不记录一次性闲聊、玩笑、辱骂、情绪评价、当天行程、临时状态、敏感隐私、猜测、反问或未确认传闻。
-6. importance 表示之后水群时是否经常有用；小事低于 0.55，低于 0.55 的内容不要输出。
-7. 不能确定时输出 []。
+4. 昵称/首选称呼输出 field=preferred_name 或 aliases；爱好输出 likes；讨厌/雷点输出 dislikes；稳定性格/长期身份特征输出 traits。
+5. 用户明确否定、纠正或要求别记时，才输出 delete/replace；普通新增用 upsert。
+6. 只保留长期有用信息：群身份、稳定关系、明确偏好、长期习惯、用户要求记住的内容、纠错后的事实。
+7. 不记录一次性闲聊、玩笑、辱骂、情绪评价、当天行程、临时状态、敏感隐私、猜测、反问或未确认传闻。
+8. importance 表示之后水群时是否经常有用；小事低于 0.55，低于 0.55 的内容不要输出。
+9. 不能确定时输出 []。
 
 消息：
 {message}
@@ -1922,12 +2168,15 @@ class GroupRelationsPlugin(Star):
 
 {personality_block}
 
-可输出两类元素。
+可输出三类元素。
 
 1. 关系记忆：描述群成员之间或群成员与组织/群体之间的稳定关系，至少要有一个群成员 user_id。
 {{"type":"relation","subject":"人物A","subject_user_id":"群成员A的ID或空","relation":"关系","object":"人物B/群/组织","object_user_id":"群成员B的ID或空","category":"relationship/role/preference/memory/correction","note":"证据摘要","confidence":0.0到1.0,"importance":0.0到1.0}}
 
-2. 用户画像：描述某个群友在当前群空间内的稳定身份、别名、偏好、长期兴趣、常见互动对象或已确认背景。
+2. 基础画像：维护昵称/首选称呼/爱好/讨厌的东西/稳定特征/长期备注。优先使用此类型合并同类信息，不要把这些内容拆成多条普通画像事实。
+{{"type":"profile_basic","operation":"upsert/delete/replace","user_id":"用户ID","display_name":"昵称或群名片","field":"preferred_name/aliases/likes/dislikes/traits/notes","key":"可选分类键，如 game/food/nickname","value":"新值或要删除的值","old_value":"replace 时的旧值或空","note":"证据摘要","confidence":0.0到1.0,"importance":0.0到1.0}}
+
+3. 普通用户画像：描述无法归入基础画像、但长期有用的稳定事实。
 {{"type":"profile","user_id":"用户ID","display_name":"昵称或群名片","category":"identity/preference/impression/memory/correction","fact":"稳定画像事实","note":"证据摘要","confidence":0.0到1.0,"importance":0.0到1.0}}
 
 抽取规则：
@@ -1936,10 +2185,12 @@ class GroupRelationsPlugin(Star):
 3. 对“我/本人/咱/楼上/他”等指代，只有能从对话行里的昵称和ID确定对象时才抽取。
 4. 用户画像必须填写 user_id；无法确定 user_id 时不要输出 profile。
 5. 关系记忆至少填写 subject_user_id 或 object_user_id；无法确认任一群成员 ID 时不要输出 relation。
-6. 只保留长期有用信息：群身份、稳定关系、明确偏好、长期习惯、用户要求记住的内容、纠错后的事实。
-7. 不记录一次性闲聊、玩笑、攻击性评价、当天行程、临时状态、敏感隐私、推测、谣言、未确认关系。
-8. importance 表示之后水群时是否经常有用；小事低于 0.55，低于 0.55 的内容不要输出。
-9. 没有值得记忆的内容时输出 []。
+6. 昵称/首选称呼输出 field=preferred_name 或 aliases；爱好输出 likes；讨厌/雷点输出 dislikes；稳定性格/长期身份特征输出 traits。
+7. 用户明确否定、纠正或要求别记时，才输出 delete/replace；普通新增用 upsert。
+8. 只保留长期有用信息：群身份、稳定关系、明确偏好、长期习惯、用户要求记住的内容、纠错后的事实。
+9. 不记录一次性闲聊、玩笑、攻击性评价、当天行程、临时状态、敏感隐私、推测、谣言、未确认关系。
+10. importance 表示之后水群时是否经常有用；小事低于 0.55，低于 0.55 的内容不要输出。
+11. 没有值得记忆的内容时输出 []。
 
 最近对话：
 {dialogue}
@@ -1970,6 +2221,28 @@ class GroupRelationsPlugin(Star):
                 importance = float(item.get("importance", 0.6))
             except (TypeError, ValueError):
                 importance = 0.6
+            if item_type in {"profile_basic", "basic_profile", "profile_field"}:
+                field = str(item.get("field") or "").strip()[:40]
+                value = str(item.get("value") or "").strip()[:120]
+                operation = str(item.get("operation") or "upsert").strip().lower()[:20]
+                if not field or (operation not in {"delete", "remove"} and not value):
+                    continue
+                memories.append(
+                    {
+                        "type": "profile_basic",
+                        "operation": operation,
+                        "user_id": str(item.get("user_id") or "").strip()[:80],
+                        "display_name": str(item.get("display_name") or item.get("subject") or "").strip()[:80],
+                        "field": field,
+                        "key": str(item.get("key") or "").strip()[:40],
+                        "value": value,
+                        "old_value": str(item.get("old_value") or "").strip()[:120],
+                        "note": note[:240],
+                        "confidence": max(0.0, min(1.0, confidence)),
+                        "importance": max(0.0, min(1.0, importance)),
+                    }
+                )
+                continue
             if item_type == "profile":
                 fact = str(item.get("fact") or "").strip()
                 if not fact:

@@ -9,6 +9,9 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
+BASIC_PROFILE_FIELDS = {"likes", "dislikes", "traits", "notes"}
+
+
 @dataclass
 class RelationRecord:
     id: str
@@ -77,7 +80,9 @@ class UserProfile:
     group_id: str
     user_id: str
     display_name: str = ""
+    preferred_name: str = ""
     aliases: list[str] = field(default_factory=list)
+    basic_profile: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     group_role: str = "unknown"
     role_evidence: str = ""
     role_updated_at: int = 0
@@ -88,7 +93,20 @@ class UserProfile:
 
     def text(self) -> str:
         fact_text = " ".join(str(item.get("fact") or "") for item in self.facts)
-        parts = [self.display_name, " ".join(self.aliases), self.group_role, fact_text]
+        basic_text = " ".join(
+            str(item.get("value") or "")
+            for items in self.basic_profile.values()
+            for item in items
+            if isinstance(item, dict)
+        )
+        parts = [
+            self.display_name,
+            self.preferred_name,
+            " ".join(self.aliases),
+            basic_text,
+            self.group_role,
+            fact_text,
+        ]
         return " ".join(part for part in parts if part).strip()
 
 
@@ -143,6 +161,85 @@ def _tokens(text: str) -> list[str]:
         if len(word) > 2:
             grams.extend(word[i : i + 3] for i in range(len(word) - 2))
     return grams
+
+
+def normalize_basic_profile_field(field: str) -> str:
+    field = normalize_text(field)
+    mapping = {
+        "like": "likes",
+        "likes": "likes",
+        "hobby": "likes",
+        "hobbies": "likes",
+        "preference": "likes",
+        "preferences": "likes",
+        "爱好": "likes",
+        "喜欢": "likes",
+        "dislike": "dislikes",
+        "dislikes": "dislikes",
+        "hate": "dislikes",
+        "hates": "dislikes",
+        "讨厌": "dislikes",
+        "不喜欢": "dislikes",
+        "trait": "traits",
+        "traits": "traits",
+        "feature": "traits",
+        "identity": "traits",
+        "特点": "traits",
+        "特征": "traits",
+        "身份": "traits",
+        "note": "notes",
+        "notes": "notes",
+        "备注": "notes",
+    }
+    return mapping.get(field, field)
+
+
+def _coerce_basic_profile(raw: Any) -> dict[str, list[dict[str, Any]]]:
+    if not isinstance(raw, dict):
+        return {field: [] for field in BASIC_PROFILE_FIELDS}
+    now = int(time.time())
+    result: dict[str, list[dict[str, Any]]] = {field: [] for field in BASIC_PROFILE_FIELDS}
+    for raw_field, raw_items in raw.items():
+        field = normalize_basic_profile_field(raw_field)
+        if field not in BASIC_PROFILE_FIELDS:
+            continue
+        if not isinstance(raw_items, list):
+            raw_items = [raw_items]
+        seen: set[tuple[str, str]] = set()
+        for raw_item in raw_items:
+            if isinstance(raw_item, dict):
+                item = dict(raw_item)
+                value = str(item.get("value") or "").strip()
+                key = str(item.get("key") or "").strip()
+            else:
+                value = str(raw_item or "").strip()
+                key = ""
+                item = {}
+            if not value:
+                continue
+            key = key or normalize_text(value)[:40]
+            dedupe_key = (normalize_text(key), normalize_text(value))
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            result[field].append(
+                {
+                    "key": key[:40],
+                    "value": re.sub(r"\s+", " ", value)[:120],
+                    "note": str(item.get("note") or "").strip()[:240],
+                    "source": str(item.get("source") or "manual").strip()[:40],
+                    "confidence": clamp_confidence(item.get("confidence", 0.8), 0.8),
+                    "importance": clamp_confidence(item.get("importance", 0.8), 0.8),
+                    "created_at": int(item.get("created_at") or now),
+                    "updated_at": int(item.get("updated_at") or item.get("created_at") or now),
+                }
+            )
+        result[field] = sorted(
+            result[field],
+            key=lambda item: (item.get("importance", 0.0), item.get("updated_at", 0)),
+            reverse=True,
+        )[:24]
+    return result
 
 
 class RelationStore:
@@ -236,11 +333,13 @@ class RelationStore:
         allowed = {field_.name for field_ in fields(UserProfile)}
         payload = {key: value for key, value in item.items() if key in allowed}
         try:
+            payload["preferred_name"] = str(payload.get("preferred_name") or "").strip()[:80]
             payload["aliases"] = [
                 str(alias).strip()
                 for alias in payload.get("aliases", [])
                 if str(alias).strip()
             ][:12]
+            payload["basic_profile"] = _coerce_basic_profile(payload.get("basic_profile", {}))
             facts = []
             for fact in payload.get("facts", []):
                 if not isinstance(fact, dict) or not str(fact.get("fact") or "").strip():
@@ -348,9 +447,10 @@ class RelationStore:
         else:
             if display_name.strip():
                 member.display_name = display_name.strip()
-            if role_rank(role) >= role_rank(member.role):
+            manual_role_locked = member.source in {"webui", "manual", "debug_command"} and source != "webui"
+            if not manual_role_locked and role_rank(role) >= role_rank(member.role):
                 member.role = role
-            member.source = source.strip() or member.source
+                member.source = source.strip() or member.source
             member.active = active
             member.last_seen_at = now
             member.verified_at = now
@@ -394,6 +494,33 @@ class RelationStore:
             group.updated_at = now
         self.save()
         return updated
+
+    def update_group_member_role(
+        self,
+        group_id: str,
+        user_id: str,
+        role: str,
+        source: str = "webui",
+    ) -> GroupMember | None:
+        member = self.get_member(group_id, user_id)
+        if not member:
+            return None
+        role = normalize_text(role) or "member"
+        if role == "manber":
+            role = "member"
+        if role not in {"owner", "admin", "member"}:
+            return None
+        now = int(time.time())
+        member.role = role
+        member.source = source.strip() or member.source
+        member.active = True
+        member.last_seen_at = now
+        member.verified_at = now
+        group = self.groups.get(group_id)
+        if group:
+            group.updated_at = now
+        self.save()
+        return member
 
     def refresh_member_directory_metadata(self, group_id: str, source: str = "event_fallback") -> None:
         group = self.groups.get(group_id)
@@ -517,7 +644,9 @@ class RelationStore:
                 group_id=group_id,
                 user_id=str(user_id).strip(),
                 display_name=display_name,
+                preferred_name="",
                 aliases=[display_name] if display_name else [],
+                basic_profile=_coerce_basic_profile({}),
                 group_role=group_role or "unknown",
                 role_evidence=role_evidence,
                 role_updated_at=now if group_role else 0,
@@ -603,6 +732,7 @@ class RelationStore:
         profile_id_: str,
         group_id: str,
         display_name: str | None = None,
+        preferred_name: str | None = None,
         aliases: list[str] | None = None,
         group_role: str | None = None,
         role_evidence: str | None = None,
@@ -612,12 +742,18 @@ class RelationStore:
             return None
         if display_name is not None:
             profile.display_name = display_name.strip()
+        if preferred_name is not None:
+            profile.preferred_name = preferred_name.strip()[:80]
+            if profile.preferred_name and profile.preferred_name not in profile.aliases:
+                profile.aliases.insert(0, profile.preferred_name)
         if aliases is not None:
             clean_aliases = []
             for alias in aliases:
                 alias = str(alias).strip()
                 if alias and alias not in clean_aliases:
                     clean_aliases.append(alias)
+            if profile.preferred_name and profile.preferred_name not in clean_aliases:
+                clean_aliases.insert(0, profile.preferred_name)
             if profile.display_name and profile.display_name not in clean_aliases:
                 clean_aliases.insert(0, profile.display_name)
             profile.aliases = clean_aliases[:12]
@@ -628,6 +764,130 @@ class RelationStore:
         profile.updated_at = int(time.time())
         self.save()
         return profile
+
+    def upsert_profile_basic(
+        self,
+        group_id: str,
+        user_id: str,
+        display_name: str,
+        field: str,
+        value: str,
+        key: str = "",
+        note: str = "",
+        source: str = "manual",
+        confidence: float = 0.8,
+        importance: float = 0.8,
+    ) -> UserProfile | None:
+        field = normalize_basic_profile_field(field)
+        value = re.sub(r"\s+", " ", str(value or "")).strip()
+        if not value:
+            return None
+        profile = self.touch_profile(group_id, user_id, display_name)
+        now = int(time.time())
+        if field in {"preferred_name", "nickname", "nicknames", "alias", "aliases"}:
+            if field == "preferred_name":
+                profile.preferred_name = value[:80]
+            if value not in profile.aliases:
+                profile.aliases.insert(0, value[:80])
+                profile.aliases = profile.aliases[:12]
+            profile.updated_at = now
+            self.save()
+            return profile
+        if field not in BASIC_PROFILE_FIELDS:
+            return None
+        profile.basic_profile = _coerce_basic_profile(profile.basic_profile)
+        key = re.sub(r"\s+", " ", str(key or "").strip())[:40] or normalize_text(value)[:40]
+        items = profile.basic_profile.setdefault(field, [])
+        key_norm = normalize_text(key)
+        value_norm = normalize_text(value)
+        existing = next(
+            (
+                item
+                for item in items
+                if normalize_text(str(item.get("key") or "")) == key_norm
+                or normalize_text(str(item.get("value") or "")) == value_norm
+            ),
+            None,
+        )
+        if existing:
+            existing["key"] = key
+            existing["value"] = value[:120]
+            existing["note"] = note.strip()[:240] or existing.get("note", "")
+            existing["source"] = source or existing.get("source", "manual")
+            existing["confidence"] = max(
+                clamp_confidence(existing.get("confidence", 0.0), 0.8),
+                clamp_confidence(confidence, 0.8),
+            )
+            existing["importance"] = max(
+                clamp_confidence(existing.get("importance", 0.0), 0.8),
+                clamp_confidence(importance, 0.8),
+            )
+            existing["updated_at"] = now
+        else:
+            items.insert(
+                0,
+                {
+                    "key": key,
+                    "value": value[:120],
+                    "note": note.strip()[:240],
+                    "source": source,
+                    "confidence": clamp_confidence(confidence, 0.8),
+                    "importance": clamp_confidence(importance, 0.8),
+                    "created_at": now,
+                    "updated_at": now,
+                },
+            )
+        profile.basic_profile[field] = sorted(
+            items,
+            key=lambda item: (item.get("importance", 0.0), item.get("updated_at", 0)),
+            reverse=True,
+        )[:24]
+        profile.updated_at = now
+        self.save()
+        return profile
+
+    def delete_profile_basic(
+        self,
+        profile_id_: str,
+        group_id: str,
+        field: str,
+        value: str = "",
+        key: str = "",
+    ) -> bool:
+        profile = self.profiles.get(profile_id_)
+        if not profile or profile.group_id != group_id:
+            return False
+        field = normalize_basic_profile_field(field)
+        value_norm = normalize_text(value)
+        key_norm = normalize_text(key)
+        changed = False
+        if field in {"preferred_name", "nickname", "nicknames", "alias", "aliases"}:
+            if field == "preferred_name" and (not value_norm or normalize_text(profile.preferred_name) == value_norm):
+                profile.preferred_name = ""
+                changed = True
+            old_aliases = list(profile.aliases)
+            profile.aliases = [
+                alias
+                for alias in profile.aliases
+                if value_norm and normalize_text(alias) != value_norm
+            ] if value_norm else profile.aliases
+            changed = changed or old_aliases != profile.aliases
+        elif field in BASIC_PROFILE_FIELDS:
+            profile.basic_profile = _coerce_basic_profile(profile.basic_profile)
+            old_items = profile.basic_profile.get(field, [])
+            profile.basic_profile[field] = [
+                item
+                for item in old_items
+                if not (
+                    (key_norm and normalize_text(str(item.get("key") or "")) == key_norm)
+                    or (value_norm and normalize_text(str(item.get("value") or "")) == value_norm)
+                )
+            ]
+            changed = len(profile.basic_profile[field]) != len(old_items)
+        if changed:
+            profile.updated_at = int(time.time())
+            self.save()
+        return changed
 
     def update_profile_fact(
         self,
@@ -925,14 +1185,39 @@ class RelationStore:
                     source.group_role,
                     "private sync",
                 )
+            changed = False
             if source.display_name and not target.display_name:
                 target.display_name = source.display_name
+                changed = True
+            if source.preferred_name and not target.preferred_name:
+                target.preferred_name = source.preferred_name
+                changed = True
             for alias in source.aliases:
                 if alias and alias not in target.aliases:
                     target.aliases.append(alias)
+                    changed = True
             target.aliases = target.aliases[:12]
+            target.basic_profile = _coerce_basic_profile(target.basic_profile)
+            source_basic = _coerce_basic_profile(source.basic_profile)
+            for field, items in source_basic.items():
+                existing_basic = {
+                    (normalize_text(str(item.get("key") or "")), normalize_text(str(item.get("value") or "")))
+                    for item in target.basic_profile.get(field, [])
+                }
+                for item in items:
+                    dedupe = (
+                        normalize_text(str(item.get("key") or "")),
+                        normalize_text(str(item.get("value") or "")),
+                    )
+                    if dedupe in existing_basic:
+                        continue
+                    copied = dict(item)
+                    copied["source"] = f"private_sync:{item.get('source', '')}".rstrip(":")
+                    target.basic_profile.setdefault(field, []).insert(0, copied)
+                    existing_basic.add(dedupe)
+                    changed = True
+                target.basic_profile[field] = target.basic_profile.get(field, [])[:24]
             existing = {normalize_text(str(item.get("fact") or "")) for item in target.facts}
-            changed = False
             for item in source.facts:
                 norm = normalize_text(str(item.get("fact") or ""))
                 if not norm or norm in existing:
@@ -1083,14 +1368,37 @@ def format_record(record: RelationRecord, with_id: bool = True) -> str:
     return f"{prefix}{category}{subject} --{record.relation}--> {object_}{note}"
 
 
+def format_basic_profile(profile: UserProfile, max_items: int = 6) -> str:
+    labels = {
+        "likes": "喜欢",
+        "dislikes": "讨厌",
+        "traits": "特征",
+        "notes": "备注",
+    }
+    parts = []
+    if profile.preferred_name:
+        parts.append(f"称呼: {profile.preferred_name}")
+    for field in ("likes", "dislikes", "traits", "notes"):
+        values = [
+            str(item.get("value") or "").strip()
+            for item in profile.basic_profile.get(field, [])[:max_items]
+            if isinstance(item, dict) and str(item.get("value") or "").strip()
+        ]
+        if values:
+            parts.append(f"{labels[field]}: {'、'.join(values)}")
+    return "；".join(parts)
+
+
 def format_profile(profile: UserProfile, max_facts: int = 5) -> str:
-    name = profile.display_name or profile.user_id
+    name = profile.preferred_name or profile.display_name or profile.user_id
     alias_text = f" aliases={','.join(profile.aliases[:4])}" if profile.aliases else ""
     role_text = f" role={profile.group_role}" if profile.group_role else ""
+    basic_text = format_basic_profile(profile, max_items=4)
     facts = [
         str(item.get("fact") or "").strip()
         for item in profile.facts[:max_facts]
         if str(item.get("fact") or "").strip()
     ]
     fact_text = "；".join(facts) if facts else "暂无画像事实"
-    return f"[{profile.user_id}] {name}{role_text}{alias_text}：{fact_text}"
+    detail = "；".join(part for part in [basic_text, fact_text] if part)
+    return f"[{profile.user_id}] {name}{role_text}{alias_text}：{detail}"

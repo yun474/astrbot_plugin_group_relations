@@ -43,22 +43,6 @@
     "default": true,
     "hint": "开启后，会根据群名、群名片/昵称和本轮消息召回少量人物关系，作为临时上下文注入给 LLM。"
   },
-  "memory_scope": {
-    "description": "记忆隔离范围",
-    "type": "string",
-    "default": "group",
-    "options": [
-      "session",
-      "group",
-      "global"
-    ],
-    "labels": [
-      "按会话隔离（群聊/私聊各自独立）",
-      "按群隔离（推荐，群聊按群统一管理，私聊按会话）",
-      "全局共享（所有会话共用）"
-    ],
-    "hint": "推荐 group：同一个群里的关系和用户画像会进入同一个群空间，便于分群管理；私聊仍按会话隔离。"
-  },
   "记忆隔离_允许跨群召回": {
     "description": "是否允许 LLM 跨群查询用户记忆",
     "type": "bool",

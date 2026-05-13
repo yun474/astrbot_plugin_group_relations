@@ -257,11 +257,11 @@ textarea:focus {
   border-top: 1px solid var(--line);
   display: grid;
   gap: 8px;
-  grid-template-columns: minmax(160px, 1fr) minmax(120px, 1fr) 88px;
+  grid-template-columns: minmax(160px, 1fr) minmax(120px, 1fr) 120px minmax(100px, 0.8fr) 110px;
   padding-top: 8px;
 }
 
-.member span {
+.member > span {
   color: var(--muted);
   overflow-wrap: anywhere;
 }
@@ -278,7 +278,35 @@ textarea:focus {
 
 .profile-title {
   display: grid;
-  grid-template-columns: minmax(140px, 1fr) minmax(140px, 1fr) 160px;
+  grid-template-columns: repeat(3, minmax(140px, 1fr)) 150px 150px minmax(180px, 1.2fr) 120px;
+  gap: 8px;
+  align-items: end;
+}
+
+.basic-profile {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: grid;
+  gap: 12px;
+  margin-top: 12px;
+  padding: 12px;
+}
+
+.subsection-title,
+.basic-group-title {
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.basic-group {
+  display: grid;
+  gap: 8px;
+}
+
+.basic-row {
+  display: grid;
+  grid-template-columns: 120px minmax(180px, 1.4fr) minmax(160px, 1fr) 88px 88px 120px;
   gap: 8px;
   align-items: end;
 }
@@ -298,6 +326,10 @@ textarea:focus {
 
 .empty {
   padding: 18px 0;
+}
+
+.empty.compact {
+  padding: 4px 0 8px;
 }
 
 .toast {
@@ -333,6 +365,7 @@ textarea:focus {
     .relation-row,
     .member,
     .profile-title,
+    .basic-row,
   .fact-row {
     grid-template-columns: 1fr;
     width: 100%;

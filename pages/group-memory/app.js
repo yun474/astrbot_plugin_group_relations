@@ -8,6 +8,13 @@ const state = {
 
 const $ = (selector) => document.querySelector(selector);
 
+const basicProfileFields = [
+  ["likes", "喜欢 / 爱好"],
+  ["dislikes", "讨厌 / 雷点"],
+  ["traits", "稳定特征"],
+  ["notes", "长期备注"],
+];
+
 function toast(message) {
   const el = $("#toast");
   el.textContent = message;
@@ -32,6 +39,20 @@ function textarea(label, value, name) {
     <label>
       <span>${label}</span>
       <textarea name="${name}">${escapeHtml(value ?? "")}</textarea>
+    </label>
+  `;
+}
+
+function roleSelect(value) {
+  const current = value || "member";
+  return `
+    <label>
+      <span>成员身份</span>
+      <select name="role">
+        ${["owner", "admin", "member"]
+          .map((role) => `<option value="${role}" ${role === current ? "selected" : ""}>${role}</option>`)
+          .join("")}
+      </select>
     </label>
   `;
 }
@@ -180,11 +201,13 @@ function renderMembers() {
   list.innerHTML = members
     .map(
       (member) => `
-        <div class="member">
+        <form class="member" data-user-id="${escapeHtml(member.user_id)}">
           <strong>${escapeHtml(member.display_name || member.user_id)}</strong>
           <span>${escapeHtml(member.user_id)}</span>
-          <span>${escapeHtml(member.role || "member")}</span>
-        </div>
+          ${roleSelect(member.role || "member")}
+          <span>${escapeHtml(member.source || "unknown")}</span>
+          <button class="secondary" data-action="save-member" type="submit">保存身份</button>
+        </form>
       `,
     )
     .join("");
@@ -197,9 +220,11 @@ function renderProfiles() {
     id: "",
     user_id: "",
     display_name: "",
+    preferred_name: "",
     group_role: "unknown",
     role_evidence: "",
     aliases: [],
+    basic_profile: {},
     facts: [],
     isNew: true,
   });
@@ -208,12 +233,14 @@ function renderProfiles() {
 
 function profilePanel(profile) {
   const aliases = (profile.aliases || []).join("\n");
+  const basics = profile.id ? basicProfile(profile) : "";
   const facts = (profile.facts || []).map((fact) => factRow(profile, fact)).join("");
   return `
     <div class="profile" data-profile-id="${escapeHtml(profile.id || "")}">
       <form class="profile-title">
         ${field("用户 ID", profile.user_id, "user_id")}
         ${field("显示名称", profile.display_name, "display_name")}
+        ${field("首选称呼", profile.preferred_name || "", "preferred_name")}
         ${field("群身份", profile.group_role || "unknown", "group_role")}
         ${field("身份来源", profile.role_evidence || "", "role_evidence")}
         ${textarea("别名", aliases, "aliases")}
@@ -225,7 +252,9 @@ function profilePanel(profile) {
       ${
         profile.id
           ? `
+            ${basics}
             <div class="facts">
+              <div class="subsection-title">普通画像事实</div>
               ${factRow(profile, { index: "", fact: "", note: "", confidence: 0.8, isNew: true })}
               ${facts || `<div class="empty">暂无画像事实</div>`}
             </div>
@@ -233,6 +262,43 @@ function profilePanel(profile) {
           : ""
       }
     </div>
+  `;
+}
+
+function basicProfile(profile) {
+  const basics = profile.basic_profile || {};
+  return `
+    <div class="basic-profile">
+      <div class="subsection-title">基础画像</div>
+      ${basicProfileFields
+        .map(([fieldName, label]) => {
+          const items = basics[fieldName] || [];
+          return `
+            <div class="basic-group">
+              <div class="basic-group-title">${label}</div>
+              ${basicRow(profile, fieldName, { key: "", value: "", note: "", confidence: 0.8, importance: 0.8, isNew: true })}
+              ${items.map((item) => basicRow(profile, fieldName, item)).join("") || `<div class="empty compact">暂无记录</div>`}
+            </div>
+          `;
+        })
+        .join("")}
+    </div>
+  `;
+}
+
+function basicRow(profile, fieldName, item) {
+  return `
+    <form class="basic-row" data-profile-id="${escapeHtml(profile.id || "")}" data-field="${escapeHtml(fieldName)}" data-key="${escapeHtml(item.key || "")}" data-value="${escapeHtml(item.value || "")}">
+      ${field("分类键", item.key, "key")}
+      ${field("内容", item.value, "value")}
+      ${field("证据备注", item.note, "note")}
+      ${field("可信度", item.confidence ?? 0.8, "confidence", "number")}
+      ${field("重要度", item.importance ?? 0.8, "importance", "number")}
+      <div class="fact-actions">
+        <button class="secondary" data-action="save-basic" type="submit">${item.isNew ? "新增" : "保存"}</button>
+        ${item.isNew ? "" : `<button class="danger" data-action="delete-basic" type="button">删除</button>`}
+      </div>
+    </form>
   `;
 }
 
@@ -290,6 +356,18 @@ async function deleteRelation(form) {
   render();
 }
 
+async function saveMember(form) {
+  const data = formData(form);
+  const result = await apiPost("member-save", {
+    group_id: state.groupId,
+    user_id: form.dataset.userId,
+    role: data.role,
+  });
+  state.memory = result.memory;
+  toast("成员身份已保存");
+  render();
+}
+
 async function saveProfile(panel, form) {
   const data = formData(form);
   const result = await apiPost("profile-save", {
@@ -300,6 +378,31 @@ async function saveProfile(panel, form) {
   });
   state.memory = result.memory;
   toast("画像已保存");
+  render();
+}
+
+async function saveBasic(form) {
+  const result = await apiPost("profile-basic-save", {
+    ...formData(form),
+    group_id: state.groupId,
+    profile_id: form.dataset.profileId,
+    field: form.dataset.field,
+  });
+  state.memory = result.memory;
+  toast("基础画像已保存");
+  render();
+}
+
+async function deleteBasic(form) {
+  const result = await apiPost("profile-basic-delete", {
+    group_id: state.groupId,
+    profile_id: form.dataset.profileId,
+    field: form.dataset.field,
+    key: form.dataset.key,
+    value: form.dataset.value,
+  });
+  state.memory = result.memory;
+  toast("基础画像已删除");
   render();
 }
 
@@ -355,6 +458,10 @@ function bindEvents() {
     const button = event.target.closest("[data-action='delete-relation']");
     if (button) run(() => deleteRelation(button.closest(".relation-row")));
   });
+  $("#memberList").addEventListener("submit", (event) => {
+    event.preventDefault();
+    run(() => saveMember(event.target));
+  });
   $("#profileList").addEventListener("submit", (event) => {
     event.preventDefault();
     const form = event.target;
@@ -364,12 +471,21 @@ function bindEvents() {
     }
     if (form.classList.contains("fact-row")) {
       run(() => saveFact(form));
+      return;
+    }
+    if (form.classList.contains("basic-row")) {
+      run(() => saveBasic(form));
     }
   });
   $("#profileList").addEventListener("click", (event) => {
     const profileButton = event.target.closest("[data-action='delete-profile']");
     if (profileButton) {
       run(() => deleteProfile(profileButton.closest(".profile")));
+      return;
+    }
+    const basicButton = event.target.closest("[data-action='delete-basic']");
+    if (basicButton) {
+      run(() => deleteBasic(basicButton.closest(".basic-row")));
       return;
     }
     const factButton = event.target.closest("[data-action='delete-fact']");
