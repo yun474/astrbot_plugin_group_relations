@@ -50,6 +50,28 @@ def _sender_id(event: AstrMessageEvent) -> str:
     return str(event.get_sender_id() or _sender_name(event) or "unknown")
 
 
+def _bot_id(event: AstrMessageEvent) -> str:
+    for attr_name in ("get_self_id", "get_bot_id"):
+        attr = getattr(event, attr_name, None)
+        if callable(attr):
+            try:
+                value = attr()
+            except Exception:
+                value = ""
+            if value:
+                return str(value)
+    message_obj = getattr(event, "message_obj", None)
+    bot = getattr(event, "bot", None)
+    for owner in (event, message_obj, bot):
+        if not owner:
+            continue
+        for attr_name in ("self_id", "bot_id", "account_id", "uin", "id"):
+            value = getattr(owner, attr_name, "")
+            if value:
+                return str(value)
+    return ""
+
+
 def _split_config_list(value) -> set[str]:
     if isinstance(value, list):
         return {str(item).strip() for item in value if str(item).strip()}
@@ -1798,6 +1820,21 @@ class GroupRelationsPlugin(Star):
             parts.append(f"facts={'；'.join(facts)}")
         return " | ".join(parts)
 
+    def _bot_group_role(self, event: AstrMessageEvent) -> str:
+        if not _is_group_event(event):
+            return "private"
+        bot_id = str(self.config.get("bot_self_user_id", "") or "").strip() or _bot_id(event)
+        if not bot_id:
+            return "unknown"
+        group_id = self._scope_id(event)
+        group = self.store.groups.get(group_id)
+        if group and group.owner_user_id and str(group.owner_user_id) == bot_id:
+            return "owner"
+        member = self.store.get_member(group_id, bot_id)
+        if member and member.active:
+            return member.role or "member"
+        return "unknown"
+
     def _cap_speaker_relations(
         self,
         event: AstrMessageEvent,
@@ -1881,8 +1918,9 @@ class GroupRelationsPlugin(Star):
             "rule:临时记忆;只信列出的事实;缺信息用 group_user_context_lookup(user_id)",
         ]
         if bool(self.config.get("enable_session_identity_injection", True)):
+            bot_role = self._bot_group_role(event)
             lines.append(
-                f"session:{session_label}; scope:{scope_id}; speaker:{sender_name}({sender_id}); bot_alias:{','.join(self._bot_aliases())}"
+                f"session:{session_label}; scope:{scope_id}; speaker:{sender_name}({sender_id}); 你在本群的身份={bot_role}; bot_alias:{','.join(self._bot_aliases())}"
             )
         if group:
             owner = group.owner_display_name or group.owner_user_id or "未知"

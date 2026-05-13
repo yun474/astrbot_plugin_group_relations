@@ -81,6 +81,7 @@
 - `群成员目录_写入时校验`：写入画像和带 user_id 的关系前是否校验群成员目录。
 - `记忆写入_关系必须包含群成员ID`：关系写入时是否要求至少带一个群成员 user_id。
 - `enable_session_identity_injection`：是否注入当前群聊/私聊身份说明。
+- `bot_self_user_id`：机器人账号 user_id，用于判断并注入“你在本群的身份”。
 - `bot_relation_aliases`：机器人在关系记忆里的可能称呼。
 - `relation_admin_user_ids`：允许使用 `/关系` 调试指令的用户 ID。
 - `allow_public_debug_commands`：是否允许所有人使用 `/关系` 调试指令，默认关闭。

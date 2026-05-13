@@ -61,6 +61,12 @@
     "default": true,
     "hint": "开启后，会明确告诉 LLM 当前是在某个群聊或私聊中、群名/会话名是什么、发言人是谁。"
   },
+  "bot_self_user_id": {
+    "description": "机器人账号 user_id",
+    "type": "string",
+    "default": "",
+    "hint": "填写机器人在平台上的账号 ID，用于在群成员目录中判断“你在本群的身份”（owner/admin/member）。留空时插件会尝试从事件对象自动识别。"
+  },
   "bot_relation_aliases": {
     "description": "机器人在关系记忆中的可能称呼",
     "type": "string",
