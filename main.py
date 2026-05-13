@@ -1770,6 +1770,34 @@ class GroupRelationsPlugin(Star):
             return f"[来自群:{self._group_label_for_memory(profile.group_id)}] {text}"
         return text
 
+    def _format_compact_record(self, record: RelationRecord, with_id: bool = True) -> str:
+        prefix = f"{record.id}:" if with_id else ""
+        category = f"[{record.category}]" if record.category and record.category != "relation" else ""
+        subject = f"{record.subject}({record.subject_user_id})" if record.subject_user_id else record.subject
+        object_ = f"{record.object}({record.object_user_id})" if record.object_user_id else record.object
+        note = f"({record.note})" if record.note else ""
+        return f"{prefix}{category}{subject}-{record.relation}->{object_}{note}"
+
+    def _format_compact_profile(self, profile, max_facts: int = 2) -> str:
+        name = profile.preferred_name or profile.display_name or profile.user_id
+        parts = [f"{profile.user_id}:{name}"]
+        if profile.group_role and profile.group_role != "unknown":
+            parts.append(f"role={profile.group_role}")
+        aliases = [alias for alias in profile.aliases[:3] if alias and alias != name]
+        if aliases:
+            parts.append(f"aka={','.join(aliases)}")
+        basic = format_basic_profile(profile, max_items=3)
+        if basic:
+            parts.append(f"base={basic}")
+        facts = [
+            str(item.get("fact") or "").strip()
+            for item in profile.facts[:max_facts]
+            if str(item.get("fact") or "").strip()
+        ]
+        if facts:
+            parts.append(f"facts={'；'.join(facts)}")
+        return " | ".join(parts)
+
     def _cap_speaker_relations(
         self,
         event: AstrMessageEvent,
@@ -1849,54 +1877,33 @@ class GroupRelationsPlugin(Star):
         profile = self.store.get_profile(scope_id, sender_id)
         related_profiles = self._find_related_profiles(scope_id, sender_id, matches)
         lines = [
-            "<group_relation_context>",
-            "以下是当前群空间的临时记忆上下文，仅供本轮回答参考。",
-            "请用这些信息理解当前在哪个群、正在和哪个群友聊天、相关人物是谁，以及他们和当前发言人的关系。",
-            "不要把未列出的关系、身份、偏好或隐私当作事实。",
+            "<gr_ctx>",
+            "rule:临时记忆;只信列出的事实;缺信息用 group_user_context_lookup(user_id)",
         ]
         if bool(self.config.get("enable_session_identity_injection", True)):
-            lines.extend(
-                [
-                    f"当前会话: {session_label}",
-                    f"当前群空间ID: {scope_id}",
-                    f"当前发言人: {sender_name}({sender_id})",
-                    f"机器人在关系记忆中的可能称呼: {', '.join(self._bot_aliases())}",
-                    "回答时优先把当前发言人理解为本轮对话对象，关系和画像都限定在当前群空间内。",
-                ]
+            lines.append(
+                f"session:{session_label}; scope:{scope_id}; speaker:{sender_name}({sender_id}); bot_alias:{','.join(self._bot_aliases())}"
             )
         if group:
             owner = group.owner_display_name or group.owner_user_id or "未知"
-            lines.extend(
-                [
-                    "",
-                    "群空间状态:",
-                    f"- 类型: {group.kind}",
-                    f"- 群主: {owner}",
-                    f"- 群主来源: {group.owner_evidence or '未记录'}",
-                    f"- 群成员目录: {group.member_count} 人，来源 {group.member_directory_source or '未初始化'}",
-                    f"- 已触达消息数: {group.message_count}",
-                    f"- 已记录关系数: {len(self.store.export_group(scope_id))}",
-                    f"- 已记录用户画像数: {len(self.store.export_profiles(scope_id))}",
-                ]
+            lines.append(
+                f"space:type={group.kind}; owner={owner}; members={group.member_count}/{group.member_directory_source or '未初始化'}; rels={len(self.store.export_group(scope_id))}; profiles={len(self.store.export_profiles(scope_id))}"
             )
         if bool(self.config.get("enable_person_profile", True)):
             profile_text = self._build_person_profile(sender_name, sender_id, profile, matches)
             if profile_text:
-                lines.extend(["", "当前发言人画像:", profile_text])
+                lines.append(f"speaker_profile:{profile_text}")
         if related_profiles:
-            lines.extend(["", "相关人物画像:"])
-            lines.extend(f"- {format_profile(item, max_facts=3)}" for item in related_profiles)
+            lines.append("profiles:")
+            lines.extend(f"- {self._format_compact_profile(item, max_facts=2)}" for item in related_profiles)
         if matches:
-            lines.extend(["", "相关关系:"])
-            for record, score in matches:
-                lines.append(f"- {format_record(record)}  score={score:.2f}")
+            lines.append("relations:")
+            for record, _score in matches:
+                lines.append(f"- {self._format_compact_record(record)}")
         lines.extend(
             [
-                "",
-                "如果用户询问群友身份、画像或人物关系但以上信息不足，可以主动调用 group_user_context_lookup；知道用户ID时必须传 user_id。",
-                "只有当用户明确提供稳定环境事实、人物关系或明确纠正时，才在开关允许时写入/修改/删除。",
-                "昵称、爱好、讨厌的东西和稳定特征优先使用 group_user_basic_profile_update；普通画像事实使用 group_user_profile_save；关系写入/修改/删除使用 group_relation_save / group_relation_update / group_relation_delete。",
-                "</group_relation_context>",
+                "write:仅用户明确提供/纠正时;基础画像=group_user_basic_profile_update;普通画像=group_user_profile_save;关系=group_relation_save/update/delete",
+                "</gr_ctx>",
             ]
         )
         return "\n".join(lines)
