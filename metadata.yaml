@@ -1,5 +1,5 @@
 name: astrbot_plugin_group_relations
-desc: 给llm提供的群身份/画像插件，支持主动注入/工具搜索。让llm理解自己的群内的身份，记住群主是谁，以及明确用户是否为admin。.
+desc: 给llm提供的群身份/用户画像插件，支持主动注入/工具搜索。除了可编辑的用户画像外，还可以让llm理解自己群内的身份，记住群主是谁，以及明确用户是否为admin。.
 help: Use /关系 help to manage and query relationship memory.
 version: v0.3.0
 author: Codex
