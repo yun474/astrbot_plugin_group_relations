@@ -32,60 +32,80 @@
           <div class="stats" id="stats"></div>
         </header>
 
-        <section class="panel" id="groupPanel">
+        <section class="panel" id="groupPanel" data-panel="group">
           <div class="section-head">
-            <h3>群空间</h3>
+            <button class="panel-toggle" type="button" data-action="toggle-panel" aria-expanded="true">
+              <span>群空间</span>
+              <span class="chevron">⌄</span>
+            </button>
             <button class="primary" id="saveGroupButton">保存群信息</button>
           </div>
-          <div class="grid two">
-            <label>
-              <span>显示名称</span>
-              <input id="groupName" />
-            </label>
-            <label>
-              <span>类型</span>
-              <select id="groupKind">
-                <option value="group">群聊</option>
-                <option value="private">私聊</option>
-                <option value="global">全局</option>
-              </select>
-            </label>
-            <label>
-              <span>群主用户 ID</span>
-              <input id="groupOwnerId" />
-            </label>
-            <label>
-              <span>群主显示名</span>
-              <input id="groupOwnerName" />
-            </label>
-            <label>
-              <span>群主来源</span>
-              <input id="groupOwnerEvidence" />
-            </label>
+          <div class="panel-body">
+            <div class="grid two">
+              <label>
+                <span>显示名称</span>
+                <input id="groupName" />
+              </label>
+              <label>
+                <span>类型</span>
+                <select id="groupKind">
+                  <option value="group">群聊</option>
+                  <option value="private">私聊</option>
+                  <option value="global">全局</option>
+                </select>
+              </label>
+              <label>
+                <span>群主用户 ID</span>
+                <input id="groupOwnerId" />
+              </label>
+              <label>
+                <span>群主显示名</span>
+                <input id="groupOwnerName" />
+              </label>
+              <label>
+                <span>群主来源</span>
+                <input id="groupOwnerEvidence" />
+              </label>
+            </div>
           </div>
         </section>
 
-        <section class="panel">
+        <section class="panel" data-panel="relations">
           <div class="section-head">
-            <h3>关系</h3>
+            <button class="panel-toggle" type="button" data-action="toggle-panel" aria-expanded="true">
+              <span>关系</span>
+              <span class="chevron">⌄</span>
+            </button>
             <button class="primary" id="addRelationButton">新增关系</button>
           </div>
-          <div class="table" id="relationTable"></div>
-        </section>
-
-        <section class="panel">
-          <div class="section-head">
-            <h3>群成员目录</h3>
+          <div class="panel-body">
+            <div class="table" id="relationTable"></div>
           </div>
-          <div class="members" id="memberList"></div>
         </section>
 
-        <section class="panel">
+        <section class="panel" data-panel="members">
           <div class="section-head">
-            <h3>用户画像</h3>
+            <button class="panel-toggle" type="button" data-action="toggle-panel" aria-expanded="false">
+              <span>群成员目录</span>
+              <span class="chevron">⌄</span>
+            </button>
+          </div>
+          <div class="panel-body">
+            <div class="members" id="memberList"></div>
+          </div>
+        </section>
+
+        <section class="panel" data-panel="profiles">
+          <div class="section-head">
+            <button class="panel-toggle" type="button" data-action="toggle-panel" aria-expanded="true">
+              <span>用户画像</span>
+              <span class="chevron">⌄</span>
+            </button>
             <button class="primary" id="addProfileButton">新增画像</button>
           </div>
-          <div class="profiles" id="profileList"></div>
+          <div class="panel-body">
+            <div class="profiles" id="profileList"></div>
+          </div>
         </section>
       </main>
     </div>

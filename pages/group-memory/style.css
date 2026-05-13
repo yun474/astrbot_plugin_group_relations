@@ -126,6 +126,40 @@ label span,
   padding: 16px;
 }
 
+.panel.is-collapsed {
+  padding-bottom: 12px;
+}
+
+.panel-body {
+  margin-top: 12px;
+}
+
+.panel-toggle {
+  align-items: center;
+  background: transparent;
+  color: var(--text);
+  display: inline-flex;
+  gap: 8px;
+  min-height: 36px;
+  padding: 0;
+  text-align: left;
+}
+
+.panel-toggle span:first-child {
+  font-size: 18px;
+  font-weight: 700;
+}
+
+.chevron {
+  color: var(--muted);
+  display: inline-grid;
+  font-size: 20px;
+  height: 24px;
+  line-height: 1;
+  place-items: center;
+  width: 20px;
+}
+
 .grid {
   display: grid;
   gap: 12px;

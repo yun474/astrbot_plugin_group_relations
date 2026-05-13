@@ -4,6 +4,12 @@ const state = {
   memory: null,
   groupId: "",
   filter: "",
+  collapsedPanels: {
+    group: false,
+    relations: false,
+    members: true,
+    profiles: false,
+  },
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -99,6 +105,31 @@ function render() {
   renderRelations();
   renderMembers();
   renderProfiles();
+  applyPanelStates();
+}
+
+function applyPanelStates() {
+  document.querySelectorAll("[data-panel]").forEach((panel) => {
+    const key = panel.dataset.panel;
+    const collapsed = Boolean(state.collapsedPanels[key]);
+    const body = panel.querySelector(".panel-body");
+    const toggle = panel.querySelector("[data-action='toggle-panel']");
+    panel.classList.toggle("is-collapsed", collapsed);
+    if (body) body.hidden = collapsed;
+    if (toggle) {
+      toggle.setAttribute("aria-expanded", String(!collapsed));
+      const chevron = toggle.querySelector(".chevron");
+      if (chevron) chevron.textContent = collapsed ? "›" : "⌄";
+    }
+  });
+}
+
+function togglePanel(button) {
+  const panel = button.closest("[data-panel]");
+  if (!panel) return;
+  const key = panel.dataset.panel;
+  state.collapsedPanels[key] = !state.collapsedPanels[key];
+  applyPanelStates();
 }
 
 function renderGroups() {
@@ -448,6 +479,10 @@ function bindEvents() {
   $("#groupList").addEventListener("click", (event) => {
     const button = event.target.closest(".group-item");
     if (button) load(button.dataset.groupId);
+  });
+  document.querySelector(".content").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-action='toggle-panel']");
+    if (button) togglePanel(button);
   });
   $("#saveGroupButton").addEventListener("click", () => run(saveGroup));
   $("#relationTable").addEventListener("submit", (event) => {
