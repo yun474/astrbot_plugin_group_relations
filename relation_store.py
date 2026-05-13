@@ -203,10 +203,9 @@ def _coerce_basic_profile(raw: Any) -> dict[str, list[dict[str, Any]]]:
         field = normalize_basic_profile_field(raw_field)
         if field not in BASIC_PROFILE_FIELDS:
             continue
-        if not isinstance(raw_items, list):
-            raw_items = [raw_items]
+        item_list = raw_items if isinstance(raw_items, list) else [raw_items]
         seen: set[tuple[str, str]] = set()
-        for raw_item in raw_items:
+        for raw_item in item_list:
             if isinstance(raw_item, dict):
                 item = dict(raw_item)
                 value = str(item.get("value") or "").strip()
@@ -341,10 +340,10 @@ class RelationStore:
             ][:12]
             payload["basic_profile"] = _coerce_basic_profile(payload.get("basic_profile", {}))
             facts = []
-            for fact in payload.get("facts", []):
-                if not isinstance(fact, dict) or not str(fact.get("fact") or "").strip():
+            for raw_fact in payload.get("facts", []):
+                if not isinstance(raw_fact, dict) or not str(raw_fact.get("fact") or "").strip():
                     continue
-                fact = dict(fact)
+                fact = dict(raw_fact)
                 fact["category"] = str(fact.get("category") or "impression").strip()
                 fact["importance"] = clamp_confidence(fact.get("importance", 0.6), 0.6)
                 facts.append(fact)
@@ -748,8 +747,8 @@ class RelationStore:
                 profile.aliases.insert(0, profile.preferred_name)
         if aliases is not None:
             clean_aliases = []
-            for alias in aliases:
-                alias = str(alias).strip()
+            for raw_alias in aliases:
+                alias = str(raw_alias).strip()
                 if alias and alias not in clean_aliases:
                     clean_aliases.append(alias)
             if profile.preferred_name and profile.preferred_name not in clean_aliases:
@@ -1199,10 +1198,10 @@ class RelationStore:
             target.aliases = target.aliases[:12]
             target.basic_profile = _coerce_basic_profile(target.basic_profile)
             source_basic = _coerce_basic_profile(source.basic_profile)
-            for field, items in source_basic.items():
+            for profile_field, items in source_basic.items():
                 existing_basic = {
                     (normalize_text(str(item.get("key") or "")), normalize_text(str(item.get("value") or "")))
-                    for item in target.basic_profile.get(field, [])
+                    for item in target.basic_profile.get(profile_field, [])
                 }
                 for item in items:
                     dedupe = (
@@ -1213,10 +1212,10 @@ class RelationStore:
                         continue
                     copied = dict(item)
                     copied["source"] = f"private_sync:{item.get('source', '')}".rstrip(":")
-                    target.basic_profile.setdefault(field, []).insert(0, copied)
+                    target.basic_profile.setdefault(profile_field, []).insert(0, copied)
                     existing_basic.add(dedupe)
                     changed = True
-                target.basic_profile[field] = target.basic_profile.get(field, [])[:24]
+                target.basic_profile[profile_field] = target.basic_profile.get(profile_field, [])[:24]
             existing = {normalize_text(str(item.get("fact") or "")) for item in target.facts}
             for item in source.facts:
                 norm = normalize_text(str(item.get("fact") or ""))
@@ -1378,14 +1377,14 @@ def format_basic_profile(profile: UserProfile, max_items: int = 6) -> str:
     parts = []
     if profile.preferred_name:
         parts.append(f"称呼: {profile.preferred_name}")
-    for field in ("likes", "dislikes", "traits", "notes"):
+    for profile_field in ("likes", "dislikes", "traits", "notes"):
         values = [
             str(item.get("value") or "").strip()
-            for item in profile.basic_profile.get(field, [])[:max_items]
+            for item in profile.basic_profile.get(profile_field, [])[:max_items]
             if isinstance(item, dict) and str(item.get("value") or "").strip()
         ]
         if values:
-            parts.append(f"{labels[field]}: {'、'.join(values)}")
+            parts.append(f"{labels[profile_field]}: {'、'.join(values)}")
     return "；".join(parts)
 
 

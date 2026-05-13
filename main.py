@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from pathlib import Path
 
@@ -99,6 +100,7 @@ class GroupRelationsPlugin(Star):
         self.store = RelationStore(data_dir)
         self.store.load()
         self._warned_summary_provider_ids: set[str] = set()
+        self._warned_summary_persona_ids: set[str] = set()
         self._warned_no_summary_provider = False
         self._summary_buffers: dict[str, list[dict[str, str]]] = {}
         self._register_web_apis()
@@ -810,7 +812,7 @@ class GroupRelationsPlugin(Star):
             event.set_extra("group_relation_skip_summary", True)
             summary_resp = await self.context.llm_generate(
                 chat_provider_id=provider_id,
-                prompt=self._summary_extract_prompt(event, dialogue),
+                prompt=await self._summary_extract_prompt(event, dialogue),
             )
             memories = self._parse_extracted_memories(summary_resp.completion_text)
             op_limit = max(1, self._cfg_int("记忆管理_每轮记忆更新操作上限", None, 6))
@@ -1126,10 +1128,10 @@ class GroupRelationsPlugin(Star):
             subject=subject or None,
             relation=relation or None,
             object_=object_ or None,
-            subject_user_id=subject_user_id if subject_user_id else None,
-            object_user_id=object_user_id if object_user_id else None,
-            category=category if category else None,
-            note=note if note else None,
+            subject_user_id=subject_user_id or None,
+            object_user_id=object_user_id or None,
+            category=category or None,
+            note=note or None,
             confidence=None if confidence < 0 else confidence,
             importance=None if importance < 0 else importance,
         )
@@ -1950,24 +1952,81 @@ class GroupRelationsPlugin(Star):
         persona_id = str(self.config.get("自动总结_人格选择", "") or "").strip()
         return persona_id or "未选择"
 
-    def _summary_persona_prompt(self) -> str:
+    def _persona_prompt_text(self, persona) -> str:
+        if not persona:
+            return ""
+        for field_name in ("system_prompt", "prompt"):
+            if isinstance(persona, dict):
+                value = persona.get(field_name, "")
+            else:
+                value = getattr(persona, field_name, "")
+                if not value:
+                    try:
+                        value = persona[field_name]
+                    except (KeyError, TypeError):
+                        value = ""
+            value = str(value or "").strip()
+            if value:
+                return value
+        return ""
+
+    def _warn_summary_persona_once(self, persona_id: str, message: str) -> None:
+        if persona_id in self._warned_summary_persona_ids:
+            return
+        logger.warning(message)
+        self._warned_summary_persona_ids.add(persona_id)
+
+    async def _summary_persona_prompt(self) -> str:
         persona_id = str(self.config.get("自动总结_人格选择", "") or "").strip()
         if not persona_id:
             return ""
         persona_manager = getattr(self.context, "persona_manager", None)
+        if not persona_manager:
+            self._warn_summary_persona_once(
+                persona_id,
+                "group relation summary persona skipped: persona_manager is unavailable.",
+            )
+            return ""
         get_persona = getattr(persona_manager, "get_persona", None)
-        if not callable(get_persona):
-            logger.warning("group relation summary persona skipped: persona_manager is unavailable.")
-            return ""
+        persona = None
         try:
-            persona = get_persona(persona_id)
+            if callable(get_persona):
+                persona = get_persona(persona_id)
+                if inspect.isawaitable(persona):
+                    persona = await persona
         except Exception as exc:
-            logger.warning(f"group relation summary persona `{persona_id}` cannot be loaded: {exc}")
-            return ""
-        system_prompt = str(getattr(persona, "system_prompt", "") or "").strip()
-        if not system_prompt:
-            logger.warning(f"group relation summary persona `{persona_id}` has empty system_prompt.")
-        return system_prompt
+            persona = None
+            get_persona_error = exc
+        else:
+            get_persona_error = None
+
+        prompt = self._persona_prompt_text(persona)
+        if prompt:
+            return prompt
+
+        get_persona_v3 = getattr(persona_manager, "get_persona_v3_by_id", None)
+        try:
+            if callable(get_persona_v3):
+                persona_v3 = get_persona_v3(persona_id)
+                if inspect.isawaitable(persona_v3):
+                    persona_v3 = await persona_v3
+                prompt = self._persona_prompt_text(persona_v3)
+                if prompt:
+                    return prompt
+        except Exception as exc:
+            get_persona_error = get_persona_error or exc
+
+        if get_persona_error:
+            self._warn_summary_persona_once(
+                persona_id,
+                f"group relation summary persona `{persona_id}` cannot be loaded: {get_persona_error}",
+            )
+        else:
+            self._warn_summary_persona_once(
+                persona_id,
+                f"group relation summary persona `{persona_id}` has empty system_prompt/prompt.",
+            )
+        return ""
 
     def _find_related_profiles(
         self,
@@ -2193,8 +2252,8 @@ class GroupRelationsPlugin(Star):
 {message}
 """.strip()
 
-    def _summary_extract_prompt(self, event: AstrMessageEvent, dialogue: str) -> str:
-        personality_prompt = self._summary_persona_prompt()
+    async def _summary_extract_prompt(self, event: AstrMessageEvent, dialogue: str) -> str:
+        personality_prompt = await self._summary_persona_prompt()
         personality_block = ""
         if personality_prompt:
             personality_block = f"""
