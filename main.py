@@ -1423,10 +1423,7 @@ class GroupRelationsPlugin(Star):
         if role_value in {"owner", "admin", "member"}:
             return role_value, "event.role"
         for attr_name, role in (
-            ("is_super_admin", "owner"),
             ("is_group_owner", "owner"),
-            ("is_owner", "owner"),
-            ("is_admin", "admin"),
             ("is_group_admin", "admin"),
         ):
             attr = getattr(event, attr_name, None)

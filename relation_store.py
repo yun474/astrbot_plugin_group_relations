@@ -469,9 +469,11 @@ class RelationStore:
             if recall_name_preference is not None:
                 member.recall_name_preference = str(recall_name_preference or "").strip()
             manual_role_locked = member.source in {"webui", "manual", "debug_command"} and source != "webui"
-            if not manual_role_locked and role_rank(role) >= role_rank(member.role):
+            source_text = source.strip()
+            platform_authoritative = source_text == "platform" or source_text.startswith("platform:")
+            if not manual_role_locked and (platform_authoritative or role_rank(role) >= role_rank(member.role)):
                 member.role = role
-                member.source = source.strip() or member.source
+                member.source = source_text or member.source
             member.active = active
             member.last_seen_at = now
             member.verified_at = now
