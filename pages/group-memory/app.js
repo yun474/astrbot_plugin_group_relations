@@ -76,6 +76,17 @@ function formData(node) {
   return Object.fromEntries(new FormData(node).entries());
 }
 
+function setMemberRefreshState(message = "", busy = false, tone = "") {
+  const status = $("#memberRefreshStatus");
+  if (status) {
+    status.textContent = message;
+    status.dataset.tone = tone;
+  }
+  document.querySelectorAll("[data-action='refresh-members-card'], [data-action='refresh-members-nickname']").forEach((button) => {
+    button.disabled = busy;
+  });
+}
+
 async function apiGet(endpoint, params = {}) {
   const result = await plugin.apiGet(endpoint, params);
   return result.data ?? result;
@@ -401,14 +412,22 @@ async function saveMember(form) {
 
 async function refreshMembers(namePreference) {
   if (!state.groupId) return;
-  const result = await apiPost("member-refresh", {
-    group_id: state.groupId,
-    name_preference: namePreference,
-  });
-  state.memory = result.memory;
   const label = namePreference === "nickname" ? "QQ 名称" : "群名片";
-  toast(`成员目录已按${label}重新获取`);
-  render();
+  setMemberRefreshState(`正在按${label}获取群成员目录...`, true);
+  try {
+    const result = await apiPost("member-refresh", {
+      group_id: state.groupId,
+      name_preference: namePreference,
+    });
+    state.memory = result.memory;
+    const count = result.refreshed_count ?? state.memory?.selected_group?.member_count ?? 0;
+    toast(`成员目录已按${label}重新获取`);
+    render();
+    setMemberRefreshState(`已按${label}获取 ${count} 个成员`, false, "ok");
+  } catch (error) {
+    setMemberRefreshState(error.message || "成员目录重新获取失败", false, "error");
+    throw error;
+  }
 }
 
 async function saveProfile(panel, form) {
@@ -493,6 +512,12 @@ function bindEvents() {
     if (button) load(button.dataset.groupId);
   });
   document.querySelector(".content").addEventListener("click", (event) => {
+    const refreshButton = event.target.closest("[data-action='refresh-members-card'], [data-action='refresh-members-nickname']");
+    if (refreshButton) {
+      const preference = refreshButton.dataset.action === "refresh-members-nickname" ? "nickname" : "card";
+      run(() => refreshMembers(preference));
+      return;
+    }
     const button = event.target.closest("[data-action='toggle-panel']");
     if (button) togglePanel(button);
   });
@@ -508,12 +533,6 @@ function bindEvents() {
   $("#memberList").addEventListener("submit", (event) => {
     event.preventDefault();
     run(() => saveMember(event.target));
-  });
-  document.querySelector("[data-action='refresh-members-card']").addEventListener("click", () => {
-    run(() => refreshMembers("card"));
-  });
-  document.querySelector("[data-action='refresh-members-nickname']").addEventListener("click", () => {
-    run(() => refreshMembers("nickname"));
   });
   $("#profileList").addEventListener("submit", (event) => {
     event.preventDefault();

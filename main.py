@@ -104,6 +104,7 @@ class GroupRelationsPlugin(Star):
         self._warned_no_summary_provider = False
         self._summary_buffers: dict[str, list[dict[str, str]]] = {}
         self._last_group_events: dict[str, AstrMessageEvent] = {}
+        self._last_group_apis: dict[str, object] = {}
         self._register_web_apis()
 
     def _cfg(self, primary: str, fallback: str | None = None, default=None):
@@ -591,14 +592,20 @@ class GroupRelationsPlugin(Star):
         if group and group.kind != "group":
             return self._web_error("only group spaces can refresh member directories")
         event = self._last_group_events.get(group_id)
-        if not event:
-            return self._web_error("当前群空间还没有可用的群事件；请先让机器人在该群收到一条消息后再刷新。", 409)
+        api = self._last_group_apis.get(group_id) or self._platform_api_from_event(event)
+        if not api:
+            return self._web_error("当前群空间还没有可用的平台 API；请先让机器人在该群收到一条消息后再刷新。", 409)
         count = await self._refresh_group_directory(
             event,
             force=True,
             group_id=group_id,
             name_preference=preference,
+            api=api,
+            allow_event_fallback=False,
         )
+        if count <= 0:
+            logger.warning(f"group relation WebUI member refresh returned empty list for group `{group_id}`")
+            return self._web_error("平台没有返回群成员列表，成员目录未更新。", 502)
         return self._web_ok(
             memory=self._web_memory_payload(group_id),
             refreshed_count=count,
@@ -1380,6 +1387,9 @@ class GroupRelationsPlugin(Star):
         )
         if kind == "group":
             self._last_group_events[scope_id] = event
+            api = self._platform_api_from_event(event)
+            if api:
+                self._last_group_apis[scope_id] = api
             self.store.upsert_group_member(
                 scope_id,
                 _sender_id(event),
@@ -1474,14 +1484,16 @@ class GroupRelationsPlugin(Star):
 
     async def _refresh_group_directory(
         self,
-        event: AstrMessageEvent,
+        event: AstrMessageEvent | None,
         force: bool = False,
         group_id: str = "",
         name_preference: str = "",
+        api=None,
+        allow_event_fallback: bool = True,
     ) -> int:
-        if not _is_group_event(event) and not group_id:
+        if (not event or not _is_group_event(event)) and not group_id:
             return 0
-        group_id = str(group_id or self._scope_id(event)).strip()
+        group_id = str(group_id or (self._scope_id(event) if event else "")).strip()
         if not group_id:
             return 0
         preference = self._member_name_preference(name_preference)
@@ -1497,6 +1509,7 @@ class GroupRelationsPlugin(Star):
             event,
             group_id=group_id,
             name_preference=preference,
+            api=api,
         )
         if members:
             source = f"platform:{preference}"
@@ -1520,28 +1533,34 @@ class GroupRelationsPlugin(Star):
                     "platform member directory",
                 )
             return len(members)
-        self.store.upsert_group_member(
-            group_id,
-            _sender_id(event),
-            _sender_name(event),
-            self._resolve_sender_group_role(event)[0],
-            "event fallback",
-        )
-        self.store.refresh_member_directory_metadata(group_id, "event_fallback_seen_only")
+        if event and allow_event_fallback:
+            self.store.upsert_group_member(
+                group_id,
+                _sender_id(event),
+                _sender_name(event),
+                self._resolve_sender_group_role(event)[0],
+                "event fallback",
+            )
+            self.store.refresh_member_directory_metadata(group_id, "event_fallback_seen_only")
         group = self.store.groups.get(group_id)
         return int(group.member_count or 0) if group else 0
 
     async def _fetch_group_member_directory(
         self,
-        event: AstrMessageEvent,
+        event: AstrMessageEvent | None,
         group_id: str = "",
         name_preference: str = "",
+        api=None,
     ) -> list[dict]:
-        group_id = str(group_id or _group_id(event)).strip()
+        group_id = str(group_id or (_group_id(event) if event else "")).strip()
         if not group_id:
             return []
         preference = self._member_name_preference(name_preference)
-        raw = await self._call_platform_action(event, "get_group_member_list", {"group_id": group_id})
+        raw = await self._call_platform_action_with_api(
+            api or self._platform_api_from_event(event),
+            "get_group_member_list",
+            {"group_id": group_id},
+        )
         items = self._extract_action_data(raw)
         if not isinstance(items, list):
             return []
@@ -1562,9 +1581,18 @@ class GroupRelationsPlugin(Star):
             )
         return members
 
+    def _platform_api_from_event(self, event: AstrMessageEvent | None):
+        bot = getattr(event, "bot", None) if event else None
+        return getattr(bot, "api", None)
+
     async def _call_platform_action(self, event: AstrMessageEvent, action: str, params: dict):
-        bot = getattr(event, "bot", None)
-        api = getattr(bot, "api", None)
+        return await self._call_platform_action_with_api(
+            self._platform_api_from_event(event),
+            action,
+            params,
+        )
+
+    async def _call_platform_action_with_api(self, api, action: str, params: dict):
         call_action = getattr(api, "call_action", None)
         if not callable(call_action):
             return None

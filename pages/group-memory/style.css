@@ -292,6 +292,20 @@ textarea:focus {
   gap: 8px;
 }
 
+.member-refresh-status {
+  color: var(--muted);
+  font-size: 13px;
+  min-height: 18px;
+}
+
+.member-refresh-status[data-tone="ok"] {
+  color: var(--accent);
+}
+
+.member-refresh-status[data-tone="error"] {
+  color: var(--danger);
+}
+
 .member {
   align-items: center;
   border-top: 1px solid var(--line);
