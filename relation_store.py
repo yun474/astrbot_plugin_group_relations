@@ -66,6 +66,9 @@ class GroupMember:
     group_id: str
     user_id: str
     display_name: str = ""
+    card: str = ""
+    nickname: str = ""
+    recall_name_preference: str = ""
     role: str = "member"
     source: str = "event"
     active: bool = True
@@ -315,6 +318,10 @@ class RelationStore:
         try:
             payload["id"] = payload.get("id") or member_id(payload["group_id"], payload["user_id"])
             payload["role"] = normalize_text(payload.get("role") or "member") or "member"
+            payload["display_name"] = str(payload.get("display_name") or "").strip()
+            payload["card"] = str(payload.get("card") or "").strip()
+            payload["nickname"] = str(payload.get("nickname") or "").strip()
+            payload["recall_name_preference"] = str(payload.get("recall_name_preference") or "").strip()
             payload["active"] = bool(payload.get("active", True))
             payload["first_seen_at"] = int(payload.get("first_seen_at") or time.time())
             payload["last_seen_at"] = int(payload.get("last_seen_at") or payload["first_seen_at"])
@@ -420,21 +427,30 @@ class RelationStore:
         group_id: str,
         user_id: str,
         display_name: str = "",
+        card: str = "",
+        nickname: str = "",
         role: str = "member",
         source: str = "event",
+        recall_name_preference: str | None = None,
         active: bool = True,
         save: bool = True,
     ) -> GroupMember:
         now = int(time.time())
         mid = member_id(group_id, user_id)
         role = normalize_text(role) or "member"
+        display_name = str(display_name or "").strip()
+        card = str(card or "").strip()
+        nickname = str(nickname or "").strip()
         member = self.members.get(mid)
         if not member:
             member = GroupMember(
                 id=mid,
                 group_id=group_id,
                 user_id=str(user_id).strip(),
-                display_name=display_name.strip(),
+                display_name=display_name or card or nickname,
+                card=card,
+                nickname=nickname,
+                recall_name_preference=str(recall_name_preference or "").strip(),
                 role=role,
                 source=source.strip() or "event",
                 active=active,
@@ -444,8 +460,14 @@ class RelationStore:
             )
             self.members[mid] = member
         else:
-            if display_name.strip():
-                member.display_name = display_name.strip()
+            if display_name:
+                member.display_name = display_name
+            if card:
+                member.card = card
+            if nickname:
+                member.nickname = nickname
+            if recall_name_preference is not None:
+                member.recall_name_preference = str(recall_name_preference or "").strip()
             manual_role_locked = member.source in {"webui", "manual", "debug_command"} and source != "webui"
             if not manual_role_locked and role_rank(role) >= role_rank(member.role):
                 member.role = role
@@ -471,11 +493,15 @@ class RelationStore:
             if not user_id:
                 continue
             seen.add(user_id)
+            card = str(item.get("card") or item.get("group_card") or "").strip()
+            nickname = str(item.get("nickname") or item.get("nick") or item.get("name") or "").strip()
             updated.append(
                 self.upsert_group_member(
                     group_id=group_id,
                     user_id=user_id,
-                    display_name=str(item.get("display_name") or item.get("nickname") or item.get("card") or "").strip(),
+                    display_name=str(item.get("display_name") or card or nickname).strip(),
+                    card=card,
+                    nickname=nickname,
                     role=str(item.get("role") or "member"),
                     source=source,
                     active=True,
@@ -493,6 +519,24 @@ class RelationStore:
             group.updated_at = now
         self.save()
         return updated
+
+    def update_group_member_name_preference(
+        self,
+        group_id: str,
+        user_id: str,
+        recall_name_preference: str,
+    ) -> GroupMember | None:
+        member = self.get_member(group_id, user_id)
+        if not member:
+            return None
+        now = int(time.time())
+        member.recall_name_preference = str(recall_name_preference or "").strip()
+        member.last_seen_at = now
+        group = self.groups.get(group_id)
+        if group:
+            group.updated_at = now
+        self.save()
+        return member
 
     def update_group_member_role(
         self,

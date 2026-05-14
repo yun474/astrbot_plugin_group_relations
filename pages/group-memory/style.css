@@ -311,7 +311,7 @@ textarea:focus {
   border-top: 1px solid var(--line);
   display: grid;
   gap: 8px;
-  grid-template-columns: minmax(160px, 1fr) minmax(120px, 1fr) 120px minmax(100px, 0.8fr) 110px;
+  grid-template-columns: minmax(120px, 1fr) minmax(110px, 0.9fr) minmax(120px, 1fr) minmax(120px, 1fr) 120px 130px minmax(90px, 0.8fr) 110px;
   padding-top: 8px;
 }
 

@@ -63,6 +63,25 @@ function roleSelect(value) {
   `;
 }
 
+function memberNamePreferenceSelect(value) {
+  const current = value || "";
+  const options = [
+    ["", "跟随配置"],
+    ["card", "群名片"],
+    ["nickname", "QQ 名称"],
+  ];
+  return `
+    <label>
+      <span>召回显示</span>
+      <select name="recall_name_preference">
+        ${options
+          .map(([optionValue, label]) => `<option value="${optionValue}" ${optionValue === current ? "selected" : ""}>${label}</option>`)
+          .join("")}
+      </select>
+    </label>
+  `;
+}
+
 function escapeHtml(value) {
   return String(value)
     .replaceAll("&", "&amp;")
@@ -82,7 +101,7 @@ function setMemberRefreshState(message = "", busy = false, tone = "") {
     status.textContent = message;
     status.dataset.tone = tone;
   }
-  document.querySelectorAll("[data-action='refresh-members-card'], [data-action='refresh-members-nickname']").forEach((button) => {
+  document.querySelectorAll("[data-action='refresh-members']").forEach((button) => {
     button.disabled = busy;
   });
 }
@@ -244,11 +263,14 @@ function renderMembers() {
     .map(
       (member) => `
         <form class="member" data-user-id="${escapeHtml(member.user_id)}">
-          <strong>${escapeHtml(member.display_name || member.user_id)}</strong>
+          <strong>${escapeHtml(member.recall_display_name || member.display_name || member.user_id)}</strong>
           <span>${escapeHtml(member.user_id)}</span>
+          <span>${escapeHtml(member.card || "无群名片")}</span>
+          <span>${escapeHtml(member.nickname || "无 QQ 名称")}</span>
           ${roleSelect(member.role || "member")}
+          ${memberNamePreferenceSelect(member.recall_name_preference || "")}
           <span>${escapeHtml(member.source || "unknown")}</span>
-          <button class="secondary" data-action="save-member" type="submit">保存身份</button>
+          <button class="secondary" data-action="save-member" type="submit">保存设置</button>
         </form>
       `,
     )
@@ -404,26 +426,25 @@ async function saveMember(form) {
     group_id: state.groupId,
     user_id: form.dataset.userId,
     role: data.role,
+    recall_name_preference: data.recall_name_preference || "",
   });
   state.memory = result.memory;
-  toast("成员身份已保存");
+  toast("成员设置已保存");
   render();
 }
 
-async function refreshMembers(namePreference) {
+async function refreshMembers() {
   if (!state.groupId) return;
-  const label = namePreference === "nickname" ? "QQ 名称" : "群名片";
-  setMemberRefreshState(`正在按${label}获取群成员目录...`, true);
+  setMemberRefreshState("正在获取群成员目录...", true);
   try {
     const result = await apiPost("member-refresh", {
       group_id: state.groupId,
-      name_preference: namePreference,
     });
     state.memory = result.memory;
     const count = result.refreshed_count ?? state.memory?.selected_group?.member_count ?? 0;
-    toast(`成员目录已按${label}重新获取`);
+    toast("成员目录已重新获取");
     render();
-    setMemberRefreshState(`已按${label}获取 ${count} 个成员`, false, "ok");
+    setMemberRefreshState(`已获取 ${count} 个成员`, false, "ok");
   } catch (error) {
     setMemberRefreshState(error.message || "成员目录重新获取失败", false, "error");
     throw error;
@@ -512,10 +533,9 @@ function bindEvents() {
     if (button) load(button.dataset.groupId);
   });
   document.querySelector(".content").addEventListener("click", (event) => {
-    const refreshButton = event.target.closest("[data-action='refresh-members-card'], [data-action='refresh-members-nickname']");
+    const refreshButton = event.target.closest("[data-action='refresh-members']");
     if (refreshButton) {
-      const preference = refreshButton.dataset.action === "refresh-members-nickname" ? "nickname" : "card";
-      run(() => refreshMembers(preference));
+      run(() => refreshMembers());
       return;
     }
     const button = event.target.closest("[data-action='toggle-panel']");
