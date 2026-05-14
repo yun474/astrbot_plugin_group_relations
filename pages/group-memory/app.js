@@ -399,6 +399,18 @@ async function saveMember(form) {
   render();
 }
 
+async function refreshMembers(namePreference) {
+  if (!state.groupId) return;
+  const result = await apiPost("member-refresh", {
+    group_id: state.groupId,
+    name_preference: namePreference,
+  });
+  state.memory = result.memory;
+  const label = namePreference === "nickname" ? "QQ 名称" : "群名片";
+  toast(`成员目录已按${label}重新获取`);
+  render();
+}
+
 async function saveProfile(panel, form) {
   const data = formData(form);
   const result = await apiPost("profile-save", {
@@ -496,6 +508,12 @@ function bindEvents() {
   $("#memberList").addEventListener("submit", (event) => {
     event.preventDefault();
     run(() => saveMember(event.target));
+  });
+  document.querySelector("[data-action='refresh-members-card']").addEventListener("click", () => {
+    run(() => refreshMembers("card"));
+  });
+  document.querySelector("[data-action='refresh-members-nickname']").addEventListener("click", () => {
+    run(() => refreshMembers("nickname"));
   });
   $("#profileList").addEventListener("submit", (event) => {
     event.preventDefault();
