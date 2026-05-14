@@ -601,8 +601,6 @@ class GroupRelationsPlugin(Star):
             return self._web_error("only group spaces can refresh member directories")
         event = self._last_group_events.get(group_id)
         api = self._last_group_apis.get(group_id) or self._platform_api_from_event(event)
-        if not api:
-            return self._web_error("当前群空间还没有可用的平台 API；请先让机器人在该群收到一条消息后再刷新。", 409)
         count = await self._refresh_group_directory(
             event,
             force=True,
@@ -612,6 +610,8 @@ class GroupRelationsPlugin(Star):
         )
         if count <= 0:
             logger.warning(f"group relation WebUI member refresh returned empty list for group `{group_id}`")
+            if not self._platform_api_candidates(event=event, group_id=group_id, preferred=api):
+                return self._web_error("当前没有可用的 aiocqhttp 平台 API；请确认机器人在线，或让机器人在该群收到一条消息后再刷新。", 409)
             return self._web_error("平台没有返回群成员列表，成员目录未更新。", 502)
         return self._web_ok(
             memory=self._web_memory_payload(group_id),
@@ -1562,13 +1562,19 @@ class GroupRelationsPlugin(Star):
         group_id = str(group_id or (_group_id(event) if event else "")).strip()
         if not group_id:
             return []
-        raw = await self._call_platform_action_with_api(
-            api or self._platform_api_from_event(event),
-            "get_group_member_list",
-            {"group_id": group_id},
-        )
-        items = self._extract_action_data(raw)
-        if not isinstance(items, list):
+        items = []
+        for candidate_api in self._platform_api_candidates(event=event, group_id=group_id, preferred=api):
+            raw = await self._call_platform_action_with_api(
+                candidate_api,
+                "get_group_member_list",
+                {"group_id": group_id},
+            )
+            data = self._extract_action_data(raw)
+            if isinstance(data, list):
+                items = data
+                self._last_group_apis[group_id] = candidate_api
+                break
+        if not items:
             return []
         members = []
         for item in items:
@@ -1605,7 +1611,90 @@ class GroupRelationsPlugin(Star):
 
     def _platform_api_from_event(self, event: AstrMessageEvent | None):
         bot = getattr(event, "bot", None) if event else None
-        return getattr(bot, "api", None)
+        return self._extract_platform_api(bot)
+
+    def _extract_platform_api(self, obj):
+        queue = [obj] if obj else []
+        seen: set[int] = set()
+        while queue:
+            current = queue.pop(0)
+            if current is None:
+                continue
+            marker = id(current)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            if callable(getattr(current, "call_action", None)):
+                return current
+            api = getattr(current, "api", None)
+            if callable(getattr(api, "call_action", None)):
+                return api
+            for attr_name in ("bot", "client"):
+                child = getattr(current, attr_name, None)
+                if child is not None and id(child) not in seen:
+                    queue.append(child)
+            get_client = getattr(current, "get_client", None)
+            if callable(get_client):
+                try:
+                    client = get_client()
+                    if client is not None and not hasattr(client, "__await__") and id(client) not in seen:
+                        queue.append(client)
+                except Exception as exc:
+                    logger.debug(f"group relation failed to get platform client: {exc}")
+        return None
+
+    def _platform_api_candidates(self, event: AstrMessageEvent | None = None, group_id: str = "", preferred=None) -> list:
+        candidates = []
+        seen: set[int] = set()
+
+        def add_api(value) -> None:
+            api = self._extract_platform_api(value)
+            if not api or not callable(getattr(api, "call_action", None)):
+                return
+            marker = id(api)
+            if marker in seen:
+                return
+            seen.add(marker)
+            candidates.append(api)
+
+        if preferred:
+            add_api(preferred)
+        if group_id:
+            add_api(self._last_group_apis.get(group_id))
+        add_api(self._platform_api_from_event(event))
+
+        get_platform = getattr(self.context, "get_platform", None)
+        platform_type = getattr(getattr(filter, "PlatformAdapterType", None), "AIOCQHTTP", None)
+        if callable(get_platform) and platform_type is not None:
+            try:
+                platform = get_platform(platform_type)
+                if platform is not None and not hasattr(platform, "__await__"):
+                    add_api(platform)
+            except Exception as exc:
+                logger.debug(f"group relation failed to get aiocqhttp platform: {exc}")
+
+        containers = [getattr(self.context, "platform_manager", None), self.context]
+        for container in containers:
+            if not container:
+                continue
+            for attr_name in ("get_insts", "get_platforms", "platform_insts", "platforms", "insts"):
+                try:
+                    value = getattr(container, attr_name, None)
+                    value = value() if callable(value) else value
+                except Exception as exc:
+                    logger.debug(f"group relation failed to inspect platform container `{attr_name}`: {exc}")
+                    continue
+                if value is None or hasattr(value, "__await__"):
+                    continue
+                if isinstance(value, dict):
+                    iterable = value.values()
+                elif isinstance(value, (list, tuple, set)):
+                    iterable = value
+                else:
+                    continue
+                for platform in iterable:
+                    add_api(platform)
+        return candidates
 
     async def _call_platform_action(self, event: AstrMessageEvent, action: str, params: dict):
         return await self._call_platform_action_with_api(

@@ -112,7 +112,16 @@ async function apiGet(endpoint, params = {}) {
 }
 
 async function apiPost(endpoint, payload = {}) {
-  const result = await plugin.apiPost(endpoint, payload);
+  let result;
+  try {
+    result = await plugin.apiPost(endpoint, payload);
+  } catch (error) {
+    const body = error?.response?.data ?? error?.data;
+    if (body?.error) {
+      throw new Error(body.error);
+    }
+    throw error;
+  }
   const body = result.data ?? result;
   if (body && body.ok === false) {
     throw new Error(body.error || "操作失败");
