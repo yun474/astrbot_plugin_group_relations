@@ -104,6 +104,7 @@ class GroupRelationsPlugin(Star):
         self._warned_no_summary_provider = False
         self._summary_buffers: dict[str, list[dict[str, str]]] = {}
         self._last_group_events: dict[str, AstrMessageEvent] = {}
+        self._last_group_apis: dict[str, object] = {}
         self._register_web_apis()
 
     def _cfg(self, primary: str, fallback: str | None = None, default=None):
@@ -428,7 +429,11 @@ class GroupRelationsPlugin(Star):
         return profile
 
     def _web_member_payload(self, member: dict) -> dict:
-        return dict(member)
+        payload = dict(member)
+        member_obj = self.store.get_member(str(payload.get("group_id") or ""), str(payload.get("user_id") or ""))
+        if member_obj:
+            payload["recall_display_name"] = self._member_recall_name(member_obj)
+        return payload
 
     def _web_memory_payload(self, selected_group_id: str = "") -> dict:
         self.store._ensure_groups()
@@ -572,6 +577,10 @@ class GroupRelationsPlugin(Star):
         group_id = str(data.get("group_id") or "").strip()
         user_id = str(data.get("user_id") or "").strip()
         role = normalize_role(data.get("role") or "member")
+        recall_name_preference = self._member_name_preference(
+            str(data.get("recall_name_preference") or ""),
+            allow_default=True,
+        )
         if not group_id or not user_id:
             return self._web_error("missing group_id or user_id")
         if role not in {"owner", "admin", "member"}:
@@ -579,30 +588,34 @@ class GroupRelationsPlugin(Star):
         member = self._apply_member_role_override(group_id, user_id, role, "webui")
         if not member:
             return self._web_error("member not found", 404)
+        member = self.store.update_group_member_name_preference(group_id, user_id, recall_name_preference) or member
         return self._web_ok(memory=self._web_memory_payload(group_id))
 
     async def web_member_refresh(self):
         data = await self._web_request_json()
         group_id = str(data.get("group_id") or "").strip()
-        preference = self._member_name_preference(str(data.get("name_preference") or ""))
         if not group_id:
             return self._web_error("missing group_id")
         group = self.store.groups.get(group_id)
         if group and group.kind != "group":
             return self._web_error("only group spaces can refresh member directories")
         event = self._last_group_events.get(group_id)
-        if not event:
-            return self._web_error("当前群空间还没有可用的群事件；请先让机器人在该群收到一条消息后再刷新。", 409)
+        api = self._last_group_apis.get(group_id) or self._platform_api_from_event(event)
+        if not api:
+            return self._web_error("当前群空间还没有可用的平台 API；请先让机器人在该群收到一条消息后再刷新。", 409)
         count = await self._refresh_group_directory(
             event,
             force=True,
             group_id=group_id,
-            name_preference=preference,
+            api=api,
+            allow_event_fallback=False,
         )
+        if count <= 0:
+            logger.warning(f"group relation WebUI member refresh returned empty list for group `{group_id}`")
+            return self._web_error("平台没有返回群成员列表，成员目录未更新。", 502)
         return self._web_ok(
             memory=self._web_memory_payload(group_id),
             refreshed_count=count,
-            name_preference=preference,
         )
 
     async def web_profile_save(self):
@@ -1380,12 +1393,15 @@ class GroupRelationsPlugin(Star):
         )
         if kind == "group":
             self._last_group_events[scope_id] = event
+            api = self._platform_api_from_event(event)
+            if api:
+                self._last_group_apis[scope_id] = api
             self.store.upsert_group_member(
-                scope_id,
-                _sender_id(event),
-                _sender_name(event),
-                group_role or "member",
-                role_evidence or "event message",
+                group_id=scope_id,
+                user_id=_sender_id(event),
+                display_name=_sender_name(event),
+                role=group_role or "member",
+                source=role_evidence or "event message",
             )
         if group_role == "owner" and not group.owner_user_id:
             self.store.set_group_owner(
@@ -1449,7 +1465,13 @@ class GroupRelationsPlugin(Star):
         if self.store.has_member(group_id, user_id):
             return True, ""
         if user_id == _sender_id(event):
-            self.store.upsert_group_member(group_id, user_id, display_name or _sender_name(event), "member", "event fallback")
+            self.store.upsert_group_member(
+                group_id=group_id,
+                user_id=user_id,
+                display_name=display_name or _sender_name(event),
+                role="member",
+                source="event fallback",
+            )
             return True, ""
         return False, f"user_id `{user_id}` 不在当前群成员目录里，刷新目录后仍未找到，已拒绝写入。"
 
@@ -1474,17 +1496,17 @@ class GroupRelationsPlugin(Star):
 
     async def _refresh_group_directory(
         self,
-        event: AstrMessageEvent,
+        event: AstrMessageEvent | None,
         force: bool = False,
         group_id: str = "",
-        name_preference: str = "",
+        api=None,
+        allow_event_fallback: bool = True,
     ) -> int:
-        if not _is_group_event(event) and not group_id:
+        if (not event or not _is_group_event(event)) and not group_id:
             return 0
-        group_id = str(group_id or self._scope_id(event)).strip()
+        group_id = str(group_id or (self._scope_id(event) if event else "")).strip()
         if not group_id:
             return 0
-        preference = self._member_name_preference(name_preference)
         group = self.store.groups.get(group_id)
         if (
             group
@@ -1496,11 +1518,10 @@ class GroupRelationsPlugin(Star):
         members = await self._fetch_group_member_directory(
             event,
             group_id=group_id,
-            name_preference=preference,
+            api=api,
         )
         if members:
-            source = f"platform:{preference}"
-            self.store.replace_group_members(group_id, members, source=source)
+            self.store.replace_group_members(group_id, members, source="platform")
             for item in members:
                 role = normalize_role(item.get("role", "member"))
                 if role in {"owner", "admin"}:
@@ -1520,28 +1541,32 @@ class GroupRelationsPlugin(Star):
                     "platform member directory",
                 )
             return len(members)
-        self.store.upsert_group_member(
-            group_id,
-            _sender_id(event),
-            _sender_name(event),
-            self._resolve_sender_group_role(event)[0],
-            "event fallback",
-        )
-        self.store.refresh_member_directory_metadata(group_id, "event_fallback_seen_only")
+        if event and allow_event_fallback:
+            self.store.upsert_group_member(
+                group_id=group_id,
+                user_id=_sender_id(event),
+                display_name=_sender_name(event),
+                role=self._resolve_sender_group_role(event)[0],
+                source="event fallback",
+            )
+            self.store.refresh_member_directory_metadata(group_id, "event_fallback_seen_only")
         group = self.store.groups.get(group_id)
         return int(group.member_count or 0) if group else 0
 
     async def _fetch_group_member_directory(
         self,
-        event: AstrMessageEvent,
+        event: AstrMessageEvent | None,
         group_id: str = "",
-        name_preference: str = "",
+        api=None,
     ) -> list[dict]:
-        group_id = str(group_id or _group_id(event)).strip()
+        group_id = str(group_id or (_group_id(event) if event else "")).strip()
         if not group_id:
             return []
-        preference = self._member_name_preference(name_preference)
-        raw = await self._call_platform_action(event, "get_group_member_list", {"group_id": group_id})
+        raw = await self._call_platform_action_with_api(
+            api or self._platform_api_from_event(event),
+            "get_group_member_list",
+            {"group_id": group_id},
+        )
         items = self._extract_action_data(raw)
         if not isinstance(items, list):
             return []
@@ -1552,19 +1577,44 @@ class GroupRelationsPlugin(Star):
             user_id = str(item.get("user_id") or item.get("id") or "").strip()
             if not user_id:
                 continue
-            display_name = self._member_display_name_from_item(item, preference, user_id)
+            card = str(
+                item.get("card")
+                or item.get("group_card")
+                or item.get("card_name")
+                or item.get("group_nickname")
+                or ""
+            ).strip()
+            nickname = str(
+                item.get("nickname")
+                or item.get("nick")
+                or item.get("qq_name")
+                or item.get("name")
+                or ""
+            ).strip()
+            display_name = self._member_display_name_from_item(item, user_id)
             members.append(
                 {
                     "user_id": user_id,
                     "display_name": display_name,
+                    "card": card,
+                    "nickname": nickname,
                     "role": normalize_role(item.get("role", "member")),
                 }
             )
         return members
 
+    def _platform_api_from_event(self, event: AstrMessageEvent | None):
+        bot = getattr(event, "bot", None) if event else None
+        return getattr(bot, "api", None)
+
     async def _call_platform_action(self, event: AstrMessageEvent, action: str, params: dict):
-        bot = getattr(event, "bot", None)
-        api = getattr(bot, "api", None)
+        return await self._call_platform_action_with_api(
+            self._platform_api_from_event(event),
+            action,
+            params,
+        )
+
+    async def _call_platform_action_with_api(self, api, action: str, params: dict):
         call_action = getattr(api, "call_action", None)
         if not callable(call_action):
             return None
@@ -1758,7 +1808,9 @@ class GroupRelationsPlugin(Star):
             lines.extend(
                 [
                     "群成员目录:",
-                    f"- 昵称/群名片: {member.display_name or user_id}",
+                    f"- 召回显示名: {self._member_recall_name(member)}",
+                    f"- 群名片: {member.card or '未记录'}",
+                    f"- QQ名称: {member.nickname or '未记录'}",
                     f"- 群身份: {member.role}",
                     f"- 目录来源: {member.source}",
                 ]
@@ -1912,17 +1964,24 @@ class GroupRelationsPlugin(Star):
             aliases = {"机器人", "AI", "助手", "本机器人", "AstrBot"}
         return sorted(aliases)
 
-    def _member_name_preference(self, override: str = "") -> str:
-        raw = str(
-            override
-            or self._cfg("群成员目录_显示名优先级", "member_directory_name_preference", "card")
-            or "card"
-        ).strip().lower()
+    def _member_name_preference(self, override: str = "", allow_default: bool = False) -> str:
+        raw = str(override or "").strip().lower()
+        if allow_default and raw in {"", "default", "auto", "global", "默认", "跟随配置"}:
+            return ""
+        if not raw:
+            raw = str(
+                self._cfg(
+                    "群成员目录_召回名称优先级",
+                    "member_directory_name_preference",
+                    self._cfg("群成员目录_显示名优先级", None, "card"),
+                )
+                or "card"
+            ).strip().lower()
         if raw in {"nickname", "nick", "name", "qq", "qq_name", "qq-name", "qq名称", "qq昵称", "qq名字", "qq名", "昵称"}:
             return "nickname"
         return "card"
 
-    def _member_display_name_from_item(self, item: dict, preference: str, user_id: str) -> str:
+    def _member_display_name_from_item(self, item: dict, user_id: str) -> str:
         card = str(
             item.get("card")
             or item.get("group_card")
@@ -1937,9 +1996,32 @@ class GroupRelationsPlugin(Star):
             or item.get("name")
             or ""
         ).strip()
-        if self._member_name_preference(preference) == "nickname":
+        if self._member_name_preference() == "nickname":
             return nickname or card or user_id
         return card or nickname or user_id
+
+    def _member_recall_name(self, member) -> str:
+        preference = self._member_name_preference(getattr(member, "recall_name_preference", ""))
+        card = str(getattr(member, "card", "") or "").strip()
+        nickname = str(getattr(member, "nickname", "") or "").strip()
+        display_name = str(getattr(member, "display_name", "") or "").strip()
+        user_id = str(getattr(member, "user_id", "") or "").strip()
+        if preference == "nickname":
+            return nickname or card or display_name or user_id
+        return card or nickname or display_name or user_id
+
+    def _member_search_names(self, member) -> list[str]:
+        return [
+            str(item or "").strip()
+            for item in [
+                getattr(member, "user_id", ""),
+                getattr(member, "card", ""),
+                getattr(member, "nickname", ""),
+                getattr(member, "display_name", ""),
+                self._member_recall_name(member),
+            ]
+            if str(item or "").strip()
+        ]
 
     def _resolve_user_id_by_name(self, group_id: str, name: str) -> str:
         needle = normalize_text(name)
@@ -1952,7 +2034,11 @@ class GroupRelationsPlugin(Star):
         if profile:
             return profile.user_id
         for member in self.store.members.values():
-            if member.group_id == group_id and member.active and normalize_text(member.display_name) == needle:
+            if (
+                member.group_id == group_id
+                and member.active
+                and any(normalize_text(item) == needle for item in self._member_search_names(member))
+            ):
                 return member.user_id
         for profile in self.store.profiles.values():
             if profile.group_id != group_id:
@@ -1972,7 +2058,7 @@ class GroupRelationsPlugin(Star):
         for member in self.store.members.values():
             if member.group_id != group_id or not member.active:
                 continue
-            fields = [member.user_id, member.display_name]
+            fields = self._member_search_names(member)
             profile = self.store.get_profile(group_id, member.user_id)
             if profile:
                 fields.extend([profile.display_name, profile.preferred_name, *profile.aliases])
@@ -1995,7 +2081,7 @@ class GroupRelationsPlugin(Star):
         for member in self.store.members.values():
             if member.group_id != group_id or not member.active or member.user_id in seen:
                 continue
-            names = [member.display_name, member.user_id]
+            names = self._member_search_names(member)
             profile = self.store.get_profile(group_id, member.user_id)
             if profile:
                 names.extend([profile.display_name, profile.preferred_name, *profile.aliases])
@@ -2007,8 +2093,14 @@ class GroupRelationsPlugin(Star):
         return members
 
     def _format_member_ref(self, member) -> str:
-        name = member.display_name or member.user_id
-        return f"{name}({member.user_id}); role={member.role}; source={member.source}"
+        name = self._member_recall_name(member)
+        details = []
+        if getattr(member, "card", ""):
+            details.append(f"card={member.card}")
+        if getattr(member, "nickname", ""):
+            details.append(f"qq_name={member.nickname}")
+        detail_text = f"; {'; '.join(details)}" if details else ""
+        return f"{name}({member.user_id}); role={member.role}; source={member.source}{detail_text}"
 
     def _collect_injection_members(
         self,
