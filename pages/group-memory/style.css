@@ -52,12 +52,18 @@ button {
 .brand,
 .topbar,
 .section-head,
+.section-actions,
 .row-actions,
 .fact-actions {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+}
+
+.section-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 h1,

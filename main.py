@@ -11,7 +11,6 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star
-from astrbot.core.agent.message import TextPart
 from astrbot.core.provider.provider import Provider
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
@@ -21,6 +20,7 @@ from .relation_store import (
     format_basic_profile,
     format_profile,
     format_record,
+    normalize_text,
 )
 
 
@@ -103,6 +103,7 @@ class GroupRelationsPlugin(Star):
         self._warned_summary_persona_ids: set[str] = set()
         self._warned_no_summary_provider = False
         self._summary_buffers: dict[str, list[dict[str, str]]] = {}
+        self._last_group_events: dict[str, AstrMessageEvent] = {}
         self._register_web_apis()
 
     def _cfg(self, primary: str, fallback: str | None = None, default=None):
@@ -363,6 +364,7 @@ class GroupRelationsPlugin(Star):
             ("memory", self.web_memory, ["GET"], "Group relation memory overview"),
             ("group-save", self.web_group_save, ["POST"], "Update group memory space"),
             ("member-save", self.web_member_save, ["POST"], "Update group member role"),
+            ("member-refresh", self.web_member_refresh, ["POST"], "Refresh group member directory"),
             ("relation-save", self.web_relation_save, ["POST"], "Create or update group relation"),
             ("relation-delete", self.web_relation_delete, ["POST"], "Delete group relation"),
             ("profile-save", self.web_profile_save, ["POST"], "Create or update group user profile"),
@@ -452,6 +454,7 @@ class GroupRelationsPlugin(Star):
             "relations": relations,
             "profiles": profiles,
             "members": members,
+            "member_name_preference": self._member_name_preference(),
         }
 
     async def web_memory(self):
@@ -577,6 +580,30 @@ class GroupRelationsPlugin(Star):
         if not member:
             return self._web_error("member not found", 404)
         return self._web_ok(memory=self._web_memory_payload(group_id))
+
+    async def web_member_refresh(self):
+        data = await self._web_request_json()
+        group_id = str(data.get("group_id") or "").strip()
+        preference = self._member_name_preference(str(data.get("name_preference") or ""))
+        if not group_id:
+            return self._web_error("missing group_id")
+        group = self.store.groups.get(group_id)
+        if group and group.kind != "group":
+            return self._web_error("only group spaces can refresh member directories")
+        event = self._last_group_events.get(group_id)
+        if not event:
+            return self._web_error("当前群空间还没有可用的群事件；请先让机器人在该群收到一条消息后再刷新。", 409)
+        count = await self._refresh_group_directory(
+            event,
+            force=True,
+            group_id=group_id,
+            name_preference=preference,
+        )
+        return self._web_ok(
+            memory=self._web_memory_payload(group_id),
+            refreshed_count=count,
+            name_preference=preference,
+        )
 
     async def web_profile_save(self):
         data = await self._web_request_json()
@@ -774,7 +801,8 @@ class GroupRelationsPlugin(Star):
         max_length = int(self.config.get("max_injected_text_length", 1200))
         if max_length > 0 and len(text) > max_length:
             text = text[:max_length].rstrip() + "\n[已截断]"
-        req.extra_user_content_parts.append(TextPart(text=text).mark_as_temp())
+        system_prompt = str(getattr(req, "system_prompt", "") or "").rstrip()
+        req.system_prompt = f"{system_prompt}\n\n{text}" if system_prompt else text
 
     @filter.on_llm_response()
     async def summarize_dialogue_relations(self, event: AstrMessageEvent, resp: LLMResponse):
@@ -839,6 +867,7 @@ class GroupRelationsPlugin(Star):
 
         注意：
         - 知道用户 ID 时必须传 user_id；query 只用于不知道 ID 时按昵称/关键词查找。
+        - 只知道群名片或 QQ 名称时传 query，工具会先查群成员目录再查画像。
         - 当前群结果优先；跨群结果会标注来源群，只能作为补充背景。
 
         Args:
@@ -846,31 +875,33 @@ class GroupRelationsPlugin(Star):
             query(string): 不知道用户 ID 时用于搜索昵称、群名片或关键词。
         """
         if not bool(self.config.get("enable_tool_read", True)):
-            yield event.plain_result("群人物上下文查询工具当前未启用。")
-            return
+            return "群人物上下文查询工具当前未启用。"
         self._touch_event_scope(event)
         lookup_user_id = str(user_id or "").strip()
         if not lookup_user_id and query.strip():
-            matched_profiles = self.store.find_profiles(
-                self._scope_id(event),
-                query=query,
-                limit=1,
-            )
-            if matched_profiles:
-                lookup_user_id = matched_profiles[0].user_id
+            matched_member = self._find_group_member_by_query(self._scope_id(event), query)
+            if matched_member:
+                lookup_user_id = matched_member.user_id
             else:
-                matches = await self._search_relations(event, query)
-                lines = [f"没有找到「{query}」对应的群成员画像。"]
-                if matches:
-                    lines.extend(["按文本找到的关系："])
-                    lines.extend(self._format_tool_record(event, record) for record, _score in matches)
+                matched_profiles = self.store.find_profiles(
+                    self._scope_id(event),
+                    query=query,
+                    limit=1,
+                )
+                if matched_profiles:
+                    lookup_user_id = matched_profiles[0].user_id
                 else:
-                    lines.append("也没有找到相关关系；请提供准确 user_id 后再查。")
-                yield event.plain_result("\n".join(lines))
-                return
+                    matches = await self._search_relations(event, query)
+                    lines = [f"没有找到「{query}」对应的群成员目录或画像。"]
+                    if matches:
+                        lines.extend(["按文本找到的关系："])
+                        lines.extend(self._format_tool_record(event, record) for record, _score in matches)
+                    else:
+                        lines.append("也没有找到相关关系；请提供准确 user_id 后再查。")
+                    return "\n".join(lines)
         lookup_user_id = lookup_user_id or _sender_id(event)
         text = self._format_user_context_lookup(event, lookup_user_id, query)
-        yield event.plain_result(text)
+        return text
 
     @filter.llm_tool(name="group_relation_save")
     async def group_relation_save(
@@ -907,8 +938,7 @@ class GroupRelationsPlugin(Star):
             importance(number): 长期重要度，0 到 1 之间；普通小事不要高于 0.5。
         """
         if not bool(self.config.get("enable_tool_write", False)):
-            yield event.plain_result("群关系记忆写入工具当前未启用。")
-            return
+            return "群关系记忆写入工具当前未启用。"
         self._touch_event_scope(event)
         confidence = max(0.0, min(1.0, float(confidence)))
         importance = max(0.0, min(1.0, float(importance)))
@@ -918,11 +948,9 @@ class GroupRelationsPlugin(Star):
             object_user_id=object_user_id,
         )
         if not ok:
-            yield event.plain_result(reason)
-            return
+            return reason
         if not self._is_relation_worth_storing(subject, relation, object_, note, confidence, importance, "tool"):
-            yield event.plain_result("这条关系太像临时闲聊或低价值小事，已拒绝写入。")
-            return
+            return "这条关系太像临时闲聊或低价值小事，已拒绝写入。"
         record = await self._remember_relation(
             group_id=self._scope_id(event),
             subject=subject,
@@ -937,7 +965,7 @@ class GroupRelationsPlugin(Star):
             importance=importance,
         )
         self._sync_private_profile_if_needed(event)
-        yield event.plain_result(f"已写入群关系上下文：{format_record(record)}")
+        return f"已写入群关系上下文：{format_record(record)}"
 
     @filter.llm_tool(name="group_user_profile_save")
     async def group_user_profile_save(
@@ -970,17 +998,14 @@ class GroupRelationsPlugin(Star):
             importance(number): 长期重要度，0 到 1 之间；普通小事不要高于 0.5。
         """
         if not bool(self.config.get("enable_tool_write", False)):
-            yield event.plain_result("群用户画像写入工具当前未启用。")
-            return
+            return "群用户画像写入工具当前未启用。"
         self._touch_event_scope(event)
         target_user_id = str(user_id or _sender_id(event))
         ok, reason = await self._validate_group_user_for_write(event, target_user_id, display_name or _sender_name(event))
         if not ok:
-            yield event.plain_result(reason)
-            return
+            return reason
         if not self._is_profile_fact_worth_storing(fact, note, confidence, importance, "tool"):
-            yield event.plain_result("这条画像太像临时闲聊或低价值小事，已拒绝写入。")
-            return
+            return "这条画像太像临时闲聊或低价值小事，已拒绝写入。"
         profile = self.store.remember_profile_fact(
             group_id=self._scope_id(event),
             user_id=target_user_id,
@@ -994,7 +1019,7 @@ class GroupRelationsPlugin(Star):
         )
         self._trim_profile_facts(profile)
         self._sync_private_profile_if_needed(event)
-        yield event.plain_result(f"已写入群用户画像上下文：{format_profile(profile)}")
+        return f"已写入群用户画像上下文：{format_profile(profile)}"
 
     @filter.llm_tool(name="group_user_basic_profile_update")
     async def group_user_basic_profile_update(
@@ -1031,29 +1056,24 @@ class GroupRelationsPlugin(Star):
         operation = str(operation or "upsert").strip().lower()
         if operation in {"delete", "remove"}:
             if not bool(self.config.get("enable_tool_update", False)):
-                yield event.plain_result("群用户基础画像删除工具当前未启用。")
-                return
+                return "群用户基础画像删除工具当前未启用。"
         elif not bool(self.config.get("enable_tool_write", False)):
-            yield event.plain_result("群用户基础画像写入工具当前未启用。")
-            return
+            return "群用户基础画像写入工具当前未启用。"
         self._touch_event_scope(event)
         target_user_id = str(user_id or _sender_id(event)).strip()
         ok, reason = await self._validate_group_user_for_write(event, target_user_id, display_name or _sender_name(event))
         if not ok:
-            yield event.plain_result(reason)
-            return
+            return reason
         profile = self.store.get_profile(self._scope_id(event), target_user_id)
         if operation in {"delete", "remove", "replace"}:
             if not profile:
-                yield event.plain_result("没有找到这个用户的画像，无法删除基础字段。")
-                return
+                return "没有找到这个用户的画像，无法删除基础字段。"
             delete_value = old_value if operation == "replace" and old_value else value
             if delete_value:
                 self.store.delete_profile_basic(profile.id, self._scope_id(event), field, value=delete_value, key=key)
         if operation not in {"delete", "remove"}:
             if not value:
-                yield event.plain_result("缺少基础画像新值。")
-                return
+                return "缺少基础画像新值。"
             profile = self.store.upsert_profile_basic(
                 group_id=self._scope_id(event),
                 user_id=target_user_id,
@@ -1068,9 +1088,7 @@ class GroupRelationsPlugin(Star):
             )
         self._sync_private_profile_if_needed(event)
         profile = profile or self.store.get_profile(self._scope_id(event), target_user_id)
-        yield event.plain_result(
-            f"已更新基础画像：{format_basic_profile(profile)}" if profile else "基础画像已更新。"
-        )
+        return f"已更新基础画像：{format_basic_profile(profile)}" if profile else "基础画像已更新。"
 
     @filter.llm_tool(name="group_relation_update")
     async def group_relation_update(
@@ -1105,13 +1123,11 @@ class GroupRelationsPlugin(Star):
             importance(number): 新长期重要度，0 到 1；不改传 -1。
         """
         if not bool(self.config.get("enable_tool_update", False)):
-            yield event.plain_result("群关系记忆修改工具当前未启用。")
-            return
+            return "群关系记忆修改工具当前未启用。"
         self._touch_event_scope(event)
         old = self.store.records.get(relation_id)
         if not old or old.group_id != self._scope_id(event):
-            yield event.plain_result("没有找到这条关系，或它不属于当前群。")
-            return
+            return "没有找到这条关系，或它不属于当前群。"
         new_subject_user_id = subject_user_id or old.subject_user_id
         new_object_user_id = object_user_id or old.object_user_id
         ok, reason = await self._validate_relation_users_for_write(
@@ -1120,8 +1136,7 @@ class GroupRelationsPlugin(Star):
             object_user_id=new_object_user_id,
         )
         if not ok:
-            yield event.plain_result(reason)
-            return
+            return reason
         updated = self.store.update(
             relation_id,
             group_id=self._scope_id(event),
@@ -1135,7 +1150,7 @@ class GroupRelationsPlugin(Star):
             confidence=None if confidence < 0 else confidence,
             importance=None if importance < 0 else importance,
         )
-        yield event.plain_result(f"已更新：{format_record(updated)}" if updated else "更新失败。")
+        return f"已更新：{format_record(updated)}" if updated else "更新失败。"
 
     @filter.llm_tool(name="group_relation_delete")
     async def group_relation_delete(self, event: AstrMessageEvent, relation_id: str, reason: str = ""):
@@ -1149,11 +1164,10 @@ class GroupRelationsPlugin(Star):
             reason(string): 删除原因摘要。
         """
         if not bool(self.config.get("enable_tool_update", False)):
-            yield event.plain_result("群关系记忆删除工具当前未启用。")
-            return
+            return "群关系记忆删除工具当前未启用。"
         self._touch_event_scope(event)
         ok = self.store.delete(relation_id, group_id=self._scope_id(event))
-        yield event.plain_result("已删除。" if ok else "没有找到这条关系，或它不属于当前群。")
+        return "已删除。" if ok else "没有找到这条关系，或它不属于当前群。"
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def auto_extract(self, event: AstrMessageEvent):
@@ -1365,6 +1379,7 @@ class GroupRelationsPlugin(Star):
             role_evidence=role_evidence,
         )
         if kind == "group":
+            self._last_group_events[scope_id] = event
             self.store.upsert_group_member(
                 scope_id,
                 _sender_id(event),
@@ -1457,10 +1472,19 @@ class GroupRelationsPlugin(Star):
                 return ok, reason
         return True, ""
 
-    async def _refresh_group_directory(self, event: AstrMessageEvent, force: bool = False) -> None:
-        if not _is_group_event(event):
-            return
-        group_id = self._scope_id(event)
+    async def _refresh_group_directory(
+        self,
+        event: AstrMessageEvent,
+        force: bool = False,
+        group_id: str = "",
+        name_preference: str = "",
+    ) -> int:
+        if not _is_group_event(event) and not group_id:
+            return 0
+        group_id = str(group_id or self._scope_id(event)).strip()
+        if not group_id:
+            return 0
+        preference = self._member_name_preference(name_preference)
         group = self.store.groups.get(group_id)
         if (
             group
@@ -1468,10 +1492,15 @@ class GroupRelationsPlugin(Star):
             and not force
             and int(group.member_directory_updated_at) > 0
         ):
-            return
-        members = await self._fetch_group_member_directory(event)
+            return int(group.member_count or 0)
+        members = await self._fetch_group_member_directory(
+            event,
+            group_id=group_id,
+            name_preference=preference,
+        )
         if members:
-            self.store.replace_group_members(group_id, members, source="platform")
+            source = f"platform:{preference}"
+            self.store.replace_group_members(group_id, members, source=source)
             for item in members:
                 role = normalize_role(item.get("role", "member"))
                 if role in {"owner", "admin"}:
@@ -1490,7 +1519,7 @@ class GroupRelationsPlugin(Star):
                     str(owner.get("display_name") or owner.get("nickname") or owner.get("card") or ""),
                     "platform member directory",
                 )
-            return
+            return len(members)
         self.store.upsert_group_member(
             group_id,
             _sender_id(event),
@@ -1499,11 +1528,19 @@ class GroupRelationsPlugin(Star):
             "event fallback",
         )
         self.store.refresh_member_directory_metadata(group_id, "event_fallback_seen_only")
+        group = self.store.groups.get(group_id)
+        return int(group.member_count or 0) if group else 0
 
-    async def _fetch_group_member_directory(self, event: AstrMessageEvent) -> list[dict]:
-        group_id = _group_id(event)
+    async def _fetch_group_member_directory(
+        self,
+        event: AstrMessageEvent,
+        group_id: str = "",
+        name_preference: str = "",
+    ) -> list[dict]:
+        group_id = str(group_id or _group_id(event)).strip()
         if not group_id:
             return []
+        preference = self._member_name_preference(name_preference)
         raw = await self._call_platform_action(event, "get_group_member_list", {"group_id": group_id})
         items = self._extract_action_data(raw)
         if not isinstance(items, list):
@@ -1515,7 +1552,7 @@ class GroupRelationsPlugin(Star):
             user_id = str(item.get("user_id") or item.get("id") or "").strip()
             if not user_id:
                 continue
-            display_name = str(item.get("card") or item.get("nickname") or item.get("name") or user_id).strip()
+            display_name = self._member_display_name_from_item(item, preference, user_id)
             members.append(
                 {
                     "user_id": user_id,
@@ -1797,8 +1834,10 @@ class GroupRelationsPlugin(Star):
     def _format_compact_record(self, record: RelationRecord, with_id: bool = True) -> str:
         prefix = f"{record.id}:" if with_id else ""
         category = f"[{record.category}]" if record.category and record.category != "relation" else ""
-        subject = f"{record.subject}({record.subject_user_id})" if record.subject_user_id else record.subject
-        object_ = f"{record.object}({record.object_user_id})" if record.object_user_id else record.object
+        subject_user_id = record.subject_user_id or self._resolve_user_id_by_name(record.group_id, record.subject)
+        object_user_id = record.object_user_id or self._resolve_user_id_by_name(record.group_id, record.object)
+        subject = f"{record.subject}({subject_user_id})" if subject_user_id else record.subject
+        object_ = f"{record.object}({object_user_id})" if object_user_id else record.object
         note = f"({record.note})" if record.note else ""
         return f"{prefix}{category}{subject}-{record.relation}->{object_}{note}"
 
@@ -1873,6 +1912,138 @@ class GroupRelationsPlugin(Star):
             aliases = {"机器人", "AI", "助手", "本机器人", "AstrBot"}
         return sorted(aliases)
 
+    def _member_name_preference(self, override: str = "") -> str:
+        raw = str(
+            override
+            or self._cfg("群成员目录_显示名优先级", "member_directory_name_preference", "card")
+            or "card"
+        ).strip().lower()
+        if raw in {"nickname", "nick", "name", "qq", "qq_name", "qq-name", "qq名称", "qq昵称", "qq名字", "qq名", "昵称"}:
+            return "nickname"
+        return "card"
+
+    def _member_display_name_from_item(self, item: dict, preference: str, user_id: str) -> str:
+        card = str(
+            item.get("card")
+            or item.get("group_card")
+            or item.get("card_name")
+            or item.get("group_nickname")
+            or ""
+        ).strip()
+        nickname = str(
+            item.get("nickname")
+            or item.get("nick")
+            or item.get("qq_name")
+            or item.get("name")
+            or ""
+        ).strip()
+        if self._member_name_preference(preference) == "nickname":
+            return nickname or card or user_id
+        return card or nickname or user_id
+
+    def _resolve_user_id_by_name(self, group_id: str, name: str) -> str:
+        needle = normalize_text(name)
+        if not needle:
+            return ""
+        for member in self.store.members.values():
+            if member.group_id == group_id and member.active and normalize_text(member.user_id) == needle:
+                return member.user_id
+        profile = self.store.get_profile(group_id, name)
+        if profile:
+            return profile.user_id
+        for member in self.store.members.values():
+            if member.group_id == group_id and member.active and normalize_text(member.display_name) == needle:
+                return member.user_id
+        for profile in self.store.profiles.values():
+            if profile.group_id != group_id:
+                continue
+            names = [profile.display_name, profile.preferred_name, *profile.aliases]
+            if any(normalize_text(item) == needle for item in names if item):
+                return profile.user_id
+        matches = self.store.find_profiles(group_id, query=name, limit=2)
+        return matches[0].user_id if len(matches) == 1 else ""
+
+    def _find_group_member_by_query(self, group_id: str, query: str):
+        needle = normalize_text(query)
+        if not needle:
+            return None
+        exact = []
+        partial = []
+        for member in self.store.members.values():
+            if member.group_id != group_id or not member.active:
+                continue
+            fields = [member.user_id, member.display_name]
+            profile = self.store.get_profile(group_id, member.user_id)
+            if profile:
+                fields.extend([profile.display_name, profile.preferred_name, *profile.aliases])
+            normalized = [normalize_text(item) for item in fields if item]
+            if needle in normalized:
+                exact.append(member)
+            elif any(needle in item for item in normalized):
+                partial.append(member)
+        candidates = exact or partial
+        if not candidates:
+            return None
+        return sorted(candidates, key=lambda item: (item.last_seen_at, item.user_id), reverse=True)[0]
+
+    def _find_mentioned_members(self, group_id: str, text: str, limit: int = 4):
+        text_norm = normalize_text(text)
+        if not text_norm:
+            return []
+        members = []
+        seen = set()
+        for member in self.store.members.values():
+            if member.group_id != group_id or not member.active or member.user_id in seen:
+                continue
+            names = [member.display_name, member.user_id]
+            profile = self.store.get_profile(group_id, member.user_id)
+            if profile:
+                names.extend([profile.display_name, profile.preferred_name, *profile.aliases])
+            if any(len(normalize_text(name)) >= 2 and normalize_text(name) in text_norm for name in names if name):
+                members.append(member)
+                seen.add(member.user_id)
+                if len(members) >= limit:
+                    break
+        return members
+
+    def _format_member_ref(self, member) -> str:
+        name = member.display_name or member.user_id
+        return f"{name}({member.user_id}); role={member.role}; source={member.source}"
+
+    def _collect_injection_members(
+        self,
+        scope_id: str,
+        sender_id: str,
+        message: str,
+        matches: list[tuple[RelationRecord, float]],
+        related_profiles,
+    ):
+        members = {}
+
+        def add(user_id: str):
+            user_id = str(user_id or "").strip()
+            if not user_id or user_id in members:
+                return
+            member = self.store.get_member(scope_id, user_id)
+            if member and member.active:
+                members[user_id] = member
+
+        add(sender_id)
+        for profile in related_profiles or []:
+            add(profile.user_id)
+        for record, _score in matches:
+            if record.group_id != scope_id:
+                continue
+            add(record.subject_user_id)
+            add(record.object_user_id)
+            if not record.subject_user_id:
+                add(self._resolve_user_id_by_name(scope_id, record.subject))
+            if not record.object_user_id:
+                add(self._resolve_user_id_by_name(scope_id, record.object))
+        for member in self._find_mentioned_members(scope_id, message, limit=6):
+            add(member.user_id)
+        return list(members.values())[:8]
+
     def _session_label(self, event: AstrMessageEvent) -> str:
         group_name = _group_name(event)
         group_id = _group_id(event)
@@ -1915,9 +2086,16 @@ class GroupRelationsPlugin(Star):
         group = self.store.groups.get(scope_id)
         profile = self.store.get_profile(scope_id, sender_id)
         related_profiles = self._find_related_profiles(scope_id, sender_id, matches)
+        related_members = self._collect_injection_members(
+            scope_id,
+            sender_id,
+            event.message_str or "",
+            matches,
+            related_profiles,
+        )
         lines = [
             "<gr_ctx>",
-            "rule:临时记忆;只信列出的事实;缺信息用 group_user_context_lookup(user_id)",
+            "rule:临时记忆;只信列出的事实;人物以 名称(user_id) 为准;只有名字没有ID时先用 group_user_context_lookup(query=名字)",
         ]
         if bool(self.config.get("enable_session_identity_injection", True)):
             bot_role = self._bot_group_role(event)
@@ -1933,6 +2111,9 @@ class GroupRelationsPlugin(Star):
             profile_text = self._build_person_profile(sender_name, sender_id, profile, matches)
             if profile_text:
                 lines.append(f"speaker_profile:{profile_text}")
+        if related_members:
+            lines.append("members:")
+            lines.extend(f"- {self._format_member_ref(item)}" for item in related_members)
         if related_profiles:
             lines.append("profiles:")
             lines.extend(f"- {self._format_compact_profile(item, max_facts=2)}" for item in related_profiles)
@@ -2089,7 +2270,7 @@ class GroupRelationsPlugin(Star):
                 or user_id in record_subject_user_id
                 or user_id in record_object_user_id
             )):
-                facts.append(format_record(record, with_id=False))
+                facts.append(self._format_compact_record(record, with_id=False))
         return "；".join(facts)
 
     async def _remember_memory_item(
